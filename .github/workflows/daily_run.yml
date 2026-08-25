@@ -24,6 +24,8 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run AI Quant Pipeline
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
         run: python paper_trading.py
 
       - name: Commit and Push updated DB

@@ -3,6 +3,8 @@ import numpy as np
 import sqlite3
 import warnings
 import time
+import os
+import sys
 from datetime import datetime, timedelta
 from FinMind.data import DataLoader
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
@@ -13,15 +15,20 @@ warnings.filterwarnings('ignore')
 
 DB_NAME = "paper_trading.db"
 
-# 初始化 DataLoader 並帶入 FinMind API Token
+# FinMind Token 一律從環境變數讀取（GitHub Actions 用 repo secret 注入），不再寫死於程式碼中
 dl = DataLoader()
-FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoiMDUxOGNoaXl1QGdtYWlsLmNvbSIsImVtYWlsIjoiMDUxOGNoaXl1QGdtYWlsLmNvbSIsInRva2VuX3ZlcnNpb24iOjAsImV4cCI6MTc4ODI0MDUwOH0.dNGO-ZUPpWW30mfiUdwMqIJV-v2bqShtiLJsoy4vh7I"
+FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN")
+
+if not FINMIND_TOKEN:
+    print("❌ 未設定 FINMIND_TOKEN 環境變數，無法登入 FinMind，中止執行。")
+    sys.exit(1)
 
 try:
-    dl.login_by_token(token=FINMIND_TOKEN)
+    dl.login_by_token(api_token=FINMIND_TOKEN)
     print("✅ FinMind API Token 驗證成功！高流量存取功能已啟動。")
 except Exception as e:
-    print(f"⚠️ API Token 登入警告: {e}")
+    print(f"❌ API Token 登入失敗: {e}")
+    sys.exit(1)
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
