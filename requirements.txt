@@ -1,8 +1,10 @@
 pandas
 numpy
 FinMind
+tqdm
 scikit-learn
 xgboost
 lightgbm
 streamlit
 plotly
+requests
