@@ -101,8 +101,8 @@ def seed_demo_predictions_if_empty():
         count_today = cursor.fetchone()[0]
         if count_today == 0:
             demo_rows = [
-                (today_str, "2330", "台積電", 1050.0, 1045.0, 1120.0, 1010.0, 68.5, "PENDING", 0, 0, None, 12.3, 22.1, 8.0, "NORMAL"),
-                (today_str, "2317", "鴻海", 205.0, 203.0, 220.0, 195.0, 61.2, "PENDING", 0, 0, None, 5.6, 11.4, 5.0, "NORMAL"),
+                (today_str, "2330", "台積電", 1050.0, 1045.0, 1120.0, 1010.0, 68.5, "PENDING", 0, 0, None, 12.3, 22.1, 8.0, "DEMO"),
+                (today_str, "2317", "鴻海", 205.0, 203.0, 220.0, 195.0, 61.2, "PENDING", 0, 0, None, 5.6, 11.4, 5.0, "DEMO"),
             ]
             cursor.executemany('''
                 INSERT INTO predictions
@@ -243,7 +243,9 @@ if not df_all.empty and 'predict_date' in df_all.columns:
 # Tab 1: 今日 AI 精選
 with tab1:
     st.subheader(f"🤖 今日 ({today_str}) AI 精選標的與建議")
-    st.caption("⚠️ 目前顯示為示範資料，尚未接上真正的 AI 選股引擎（見程式中 seed_demo_predictions_if_empty）。")
+    is_demo_data = not df_today.empty and 'market_regime' in df_today.columns and (df_today['market_regime'] == 'DEMO').all()
+    if is_demo_data:
+        st.caption("⚠️ 今日 AI 引擎尚未產生真實推薦（可能排程未執行或無標的達標），目前顯示為示範資料。")
     if not df_today.empty:
         for _, row in df_today.iterrows():
             l_price = float(row.get('latest_price', 0))
