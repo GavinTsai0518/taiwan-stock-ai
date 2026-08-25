@@ -5,6 +5,7 @@ tqdm
 scikit-learn
 xgboost
 lightgbm
-streamlit
+streamlit>=1.38,<1.40
+anyio>=4.4,<4.7
 plotly
 requests
