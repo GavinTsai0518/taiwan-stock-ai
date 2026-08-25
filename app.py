@@ -67,7 +67,9 @@ df_today = pd.read_sql(f"SELECT * FROM predictions WHERE predict_date='{today_st
 
 current_regime = 'NORMAL'
 if not df_today.empty and 'market_regime' in df_today.columns:
-    current_regime = df_today['market_regime'].iloc[0]
+    val = df_today['market_regime'].iloc[0]
+    if pd.notna(val):
+        current_regime = val
 
 col_status1, col_status2 = st.columns([1, 2])
 
@@ -104,7 +106,14 @@ if not df_today.empty:
         downside = round(((row['latest_price'] - row['sl_price']) / row['latest_price']) * 100, 1)
         rr_ratio = round(upside / (downside + 1e-6), 2)
         
-        rev_yoy = row.get('revenue_yoy', 'N/A')
+        # 營收 YoY 格式化防護處理
+        rev_yoy_raw = row.get('revenue_yoy', None)
+        if pd.notna(rev_yoy_raw) and rev_yoy_raw != 'N/A':
+            rev_val = float(rev_yoy_raw)
+            rev_str = f"+{rev_val:.1f}%" if rev_val > 0 else f"{rev_val:.1f}%"
+        else:
+            rev_str = "未提供"
+
         pe_val = row.get('pe_ratio', 'N/A')
         pos_size = row.get('position_size', 5.0)
 
@@ -115,7 +124,7 @@ if not df_today.empty:
                 <b>最新收盤價：</b> NT$ {row['latest_price']} ｜ 
                 <b>AI 預估勝率：</b> <span style="color:#d97706; font-size:18px; font-weight:bold;">{row['ai_win_rate']}%</span> ｜
                 <b>建議部位配置：</b> <span style="color:#2563eb; font-size:18px; font-weight:bold;">{pos_size}% 總資金</span> ｜
-                <b>營收 YoY：</b> <span style="color:#16a34a; font-weight:bold;">+{rev_yoy}%</span>
+                <b>營收 YoY：</b> <span style="color:#16a34a; font-weight:bold;">{rev_str}</span>
             </p>
         </div>
         """, unsafe_allow_html=True)
