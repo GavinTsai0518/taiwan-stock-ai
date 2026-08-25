@@ -292,8 +292,10 @@ def get_market_active_stocks():
         today_str = datetime.now().strftime('%Y-%m-%d')
         df_all = dl.taiwan_stock_daily(stock_id='', start_date=recent_start, end_date=today_str)
         time.sleep(0.15)
+        print(f"🔎 全市場快照筆數: {len(df_all)}，欄位: {list(df_all.columns) if not df_all.empty else '空'}")
 
         if df_all.empty or 'stock_id' not in df_all.columns or 'date' not in df_all.columns:
+            print("⚠️ 全市場快照為空或缺少必要欄位，退回備援清單。")
             return _fallback_stock_pool()
 
         latest_date = df_all['date'].max()
@@ -320,6 +322,7 @@ def get_market_active_stocks():
             pass
 
         if df_latest.empty:
+            print("⚠️ 篩選後（4碼數字、排除ETF）已無候選股，退回備援清單。")
             return _fallback_stock_pool()
 
         df_top = df_latest.sort_values(by='Trading_Volume', ascending=False).head(CANDIDATE_POOL_SIZE)
@@ -329,8 +332,14 @@ def get_market_active_stocks():
             sid = row['stock_id']
             pool[sid] = name_map.get(sid, row.get('stock_name', sid))
 
-        return pool if pool else _fallback_stock_pool()
-    except Exception:
+        if not pool:
+            print("⚠️ 候選池為空，退回備援清單。")
+            return _fallback_stock_pool()
+        return pool
+    except Exception as e:
+        import traceback
+        print(f"❌ 全市場動態選股失敗，退回備援清單。錯誤：{e}")
+        traceback.print_exc()
         return _fallback_stock_pool()
 
 # ==========================================
