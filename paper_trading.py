@@ -13,11 +13,7 @@ warnings.filterwarnings('ignore')
 DB_NAME = "paper_trading.db"
 dl = DataLoader()
 
-# ==========================================
-# 1. 資料庫初始化 (SQLite)
-# ==========================================
 def init_db():
-    """建立 SQLite 資料庫與預測紀錄表"""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute('''
@@ -31,29 +27,18 @@ def init_db():
             tp_price REAL,
             sl_price REAL,
             ai_win_rate REAL,
-            status TEXT DEFAULT 'PENDING',  -- PENDING, WIN, LOSS, EXPIRED
+            status TEXT DEFAULT 'PENDING',
             real_max_price REAL DEFAULT 0,
             real_min_price REAL DEFAULT 0,
-            validated_date TEXT
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS model_metrics (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            eval_date TEXT,
-            historical_win_rate REAL,
-            adapted_threshold REAL,
-            top_feature TEXT
+            validated_date TEXT,
+            revenue_yoy REAL,
+            pe_ratio REAL
         )
     ''')
     conn.commit()
     conn.close()
 
-# ==========================================
-# 2. 自動結算歷史紀錄 (Audit)
-# ==========================================
 def audit_past_predictions():
-    """自動比對過去尚未平倉的預測紀錄，檢驗是否到達停利或停損價"""
     init_db()
     conn = sqlite3.connect(DB_NAME)
     pending_df = pd.read_sql("SELECT * FROM predictions WHERE status='PENDING'", conn)
@@ -99,16 +84,12 @@ def audit_past_predictions():
     conn.commit()
     conn.close()
 
-# ==========================================
-# 3. AI 自適應門檻與自校正模組 (Adaptive Calibration)
-# ==========================================
 def get_adaptive_threshold():
-    """依據近期盲測實戰勝率，動態校正今天的進場門檻"""
     conn = sqlite3.connect(DB_NAME)
     df_history = pd.read_sql("SELECT status FROM predictions WHERE status!='PENDING' ORDER BY id DESC LIMIT 20", conn)
     conn.close()
 
-    base_threshold = 0.58  # 預設基準門檻 58%
+    base_threshold = 0.58
 
     if df_history.empty or len(df_history) < 5:
         print(f"🤖 [AI 自適應模組] 歷史平倉數據不足 (<5 筆)，維持預設進場門檻: {base_threshold*100:.1f}%")
@@ -118,12 +99,11 @@ def get_adaptive_threshold():
     total = len(df_history)
     recent_win_rate = wins / total
 
-    # 自校正邏輯：根據近期勝率動態調整門檻
     if recent_win_rate < 0.45:
-        adjusted_threshold = 0.63  # 勝率過低，收緊條件
+        adjusted_threshold = 0.63
         reason = "近期實戰勝率低於 45%，提高選股標準以降低風險"
     elif recent_win_rate >= 0.65:
-        adjusted_threshold = 0.56  # 勝率優異，適度放寬
+        adjusted_threshold = 0.56
         reason = "近期實戰勝率達 65% 以上，表現優異，適度放寬選股標準"
     else:
         adjusted_threshold = base_threshold
@@ -133,9 +113,6 @@ def get_adaptive_threshold():
     print(f"🎯 今日 AI 動態調整後進場門檻: {adjusted_threshold*100:.1f}%\n")
     return adjusted_threshold
 
-# ==========================================
-# 4. 獲取市場焦點標的
-# ==========================================
 def get_market_active_stocks():
     default_pool = {
         '2330': '台積電', '2317': '鴻海',   '2454': '聯發科', '2308': '台達電',
@@ -158,28 +135,16 @@ def get_market_active_stocks():
         pass
     return default_pool
 
-# ==========================================
-# 5. 主程式：滾動重訓、選股、AI 自我評估與紀錄
-# ==========================================
 def main():
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 啟動全市場 AI 自適應量化選股系統...")
-    
-    # 1. 執行歷史對照結算
-    print("1. 正在檢查與結算歷史預測紀錄 (Forward Testing Audit)...")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 啟動全市場 AI 自適應+基本面量化選股系統...")
     audit_past_predictions()
-
-    # 2. 獲取動態校正後的進場門檻
-    print("2. 進行 AI 自適應門檻校正...")
     adaptive_threshold = get_adaptive_threshold()
-
-    # 3. 獲取焦點個股
-    print("3. 正在取得市場焦點熱門個股動態清單...")
     dynamic_stock_pool = get_market_active_stocks()
 
-    print(f"✅ 成功鎖定 {len(dynamic_stock_pool)} 支熱門標的！開始進行『滾動式訓練 + 特徵動態評估』AI 運算...\n")
+    print(f"✅ 成功鎖定 {len(dynamic_stock_pool)} 支熱門標的！開始導入基本面 (營收 YoY + PER) 與 AI 運算...\n")
 
     today_str = datetime.now().strftime('%Y-%m-%d')
-    start_date = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d') # 滾動 180 天最新資料
+    start_date = (datetime.now() - timedelta(days=210)).strftime('%Y-%m-%d')
     
     init_db()
     conn = sqlite3.connect(DB_NAME)
@@ -188,23 +153,62 @@ def main():
 
     for stock_id, name in dynamic_stock_pool.items():
         try:
+            # 1. 抓取日 K 線數據
             df = dl.taiwan_stock_daily(stock_id=stock_id, start_date=start_date)
             if df.empty or len(df) < 50:
                 continue
             df = df.rename(columns={'max': 'High', 'min': 'Low', 'close': 'Close', 'Trading_Volume': 'Volume'})
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.sort_values('date').reset_index(drop=True)
 
+            # 2. 籌碼資料
             df_chip = dl.taiwan_stock_institutional_investors(stock_id=stock_id, start_date=start_date)
             if not df_chip.empty:
                 foreign_buy = df_chip[df_chip['name'] == 'Foreign_Investor'].groupby('date')['buy'].sum() - \
                               df_chip[df_chip['name'] == 'Foreign_Investor'].groupby('date')['sell'].sum()
                 trust_buy = df_chip[df_chip['name'] == 'Investment_Trust'].groupby('date')['buy'].sum() - \
                             df_chip[df_chip['name'] == 'Investment_Trust'].groupby('date')['sell'].sum()
-                df['Foreign_Buy'] = df['date'].map(foreign_buy).fillna(0)
-                df['Trust_Buy'] = df['date'].map(trust_buy).fillna(0)
+                df['Foreign_Buy'] = df['date'].dt.strftime('%Y-%m-%d').map(foreign_buy).fillna(0)
+                df['Trust_Buy'] = df['date'].dt.strftime('%Y-%m-%d').map(trust_buy).fillna(0)
             else:
                 df['Foreign_Buy'], df['Trust_Buy'] = 0, 0
 
-            # 特徵建構
+            # 3. 基本面資料：營收 (Month Revenue) 與 本益比 (PER)
+            try:
+                df_rev = dl.taiwan_stock_month_revenue(stock_id=stock_id, start_date=start_date)
+                if not df_rev.empty and 'revenue_year' in df_rev.columns and 'revenue_month' in df_rev.columns:
+                    # 依公告日對齊：假設次月 10 號發布營收
+                    df_rev['announce_date'] = pd.to_datetime(
+                        df_rev['revenue_year'].astype(str) + '-' + 
+                        df_rev['revenue_month'].astype(str).str.zfill(2) + '-10'
+                    )
+                    df_rev = df_rev.sort_values('announce_date')
+                    df = pd.merge_asof(df, df_rev[['announce_date', 'revenue_year_growth_ratio']], 
+                                      left_on='date', right_on='announce_date', direction='backward')
+                    df['Revenue_YoY'] = df['revenue_year_growth_ratio'].fillna(0)
+                else:
+                    df['Revenue_YoY'] = 0
+            except Exception:
+                df['Revenue_YoY'] = 0
+
+            try:
+                df_per = dl.taiwan_stock_per_pbr(stock_id=stock_id, start_date=start_date)
+                if not df_per.empty and 'PER' in df_per.columns:
+                    df_per['date'] = pd.to_datetime(df_per['date'])
+                    df = pd.merge(df, df_per[['date', 'PER']], on='date', how='left')
+                    df['PER'] = df['PER'].fillna(15.0)  # 無資料給予預設值
+                else:
+                    df['PER'] = 15.0
+            except Exception:
+                df['PER'] = 15.0
+
+            # 4. 第一層基本面硬性濾網 (Hard Filter)
+            latest_yoy = df['Revenue_YoY'].iloc[-1]
+            latest_per = df['PER'].iloc[-1]
+            if latest_yoy < -15.0 or latest_per > 65.0 or latest_per < 0:
+                continue  # 過濾營收嚴重衰退或虧損高估值股票
+
+            # 5. 技術面與籌碼面特徵建構
             df['SMA_5'] = df['Close'].rolling(5).mean()
             df['SMA_20'] = df['Close'].rolling(20).mean()
             df['MA_Diff_5_20'] = (df['SMA_5'] - df['SMA_20']) / df['SMA_20']
@@ -226,10 +230,11 @@ def main():
             if len(df_clean) < 30:
                 continue
 
-            features = ['MA_Diff_5_20', 'Return_1D', 'Return_5D', 'RSI_14', 'Inst_Ratio']
+            # 6. 擴充多因子特徵池
+            features = ['MA_Diff_5_20', 'Return_1D', 'Return_5D', 'RSI_14', 'Inst_Ratio', 'Revenue_YoY', 'PER']
             X, y = df_clean[features], df_clean['Target']
 
-            # 三模型滾動重訓 (Rolling Re-training)
+            # 7. 三模型滾動重訓
             clf1 = XGBClassifier(n_estimators=40, learning_rate=0.03, max_depth=3, random_state=42)
             clf2 = LGBMClassifier(n_estimators=40, learning_rate=0.03, max_depth=3, random_state=42, verbose=-1)
             clf3 = RandomForestClassifier(n_estimators=40, max_depth=3, random_state=42)
@@ -237,7 +242,6 @@ def main():
             ensemble_model = VotingClassifier(estimators=[('xgb', clf1), ('lgb', clf2), ('rf', clf3)], voting='soft')
             ensemble_model.fit(X, y)
 
-            # 記錄各因子重要性
             clf1.fit(X, y)
             feature_importance_tracker.append(clf1.feature_importances_)
 
@@ -253,33 +257,33 @@ def main():
 
             status = "🔥 建議買進" if up_prob >= adaptive_threshold else "☁️ 觀望"
 
-            # 僅寫入符合動態校正門檻的標的
             if up_prob >= adaptive_threshold:
                 check_df = pd.read_sql(f"SELECT * FROM predictions WHERE predict_date='{today_str}' AND stock_id='{stock_id}'", conn)
                 if check_df.empty:
                     cursor = conn.cursor()
                     cursor.execute('''
-                        INSERT INTO predictions (predict_date, stock_id, stock_name, latest_price, buy_price, tp_price, sl_price, ai_win_rate)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (today_str, stock_id, name, latest_price, buy_price, tp_price, sl_price, round(up_prob * 100, 1)))
+                        INSERT INTO predictions (predict_date, stock_id, stock_name, latest_price, buy_price, tp_price, sl_price, ai_win_rate, revenue_yoy, pe_ratio)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (today_str, stock_id, name, latest_price, buy_price, tp_price, sl_price, round(up_prob * 100, 1), round(latest_yoy, 1), round(latest_per, 1)))
 
             results.append({
                 '股票代碼': stock_id,
                 '股票名稱': name,
                 '最新收盤價': latest_price,
+                '營收YoY(%)': round(latest_yoy, 1),
+                '本益比(PE)': round(latest_per, 1),
                 'AI 勝率預估(%)': round(up_prob * 100, 1),
                 '決策建議': status,
                 '建議買入價': buy_price,
-                '建議停利價 (前高)': tp_price,
-                '建議停損價 (支撐)': sl_price
+                '建議停利價': tp_price,
+                '建議停損價': sl_price
             })
-        except Exception:
+        except Exception as e:
             continue
 
     conn.commit()
     conn.close()
 
-    # 印出因子重要性自我診斷
     if feature_importance_tracker:
         avg_importance = np.mean(feature_importance_tracker, axis=0)
         top_feature_idx = np.argmax(avg_importance)
@@ -288,12 +292,11 @@ def main():
     if results:
         final_df = pd.DataFrame(results)
         final_df = final_df.sort_values(by='AI 勝率預估(%)', ascending=False).reset_index(drop=True)
-        
-        print("=== 全市場 AI 自適應選股與交易價位表 ===")
+        print("=== 全市場 AI 自適應+基本面選股結果 ===")
         print(final_df.to_string(index=False))
-        print(f"\n✅ 選股完成！勝率 >= {adaptive_threshold*100:.1f}% 之精選標的已同步記錄至 paper_trading.db。")
+        print(f"\n✅ 選股完成！勝率 >= {adaptive_threshold*100:.1f}% 之基本面優良標的已記錄至 paper_trading.db。")
     else:
-        print("今日市場標的經 AI 評估後無符合當前自適應門檻之標的。")
+        print("今日市場標的經 AI 與基本面過濾後無符合條件標的。")
 
 if __name__ == "__main__":
     main()
