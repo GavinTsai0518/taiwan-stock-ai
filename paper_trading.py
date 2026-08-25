@@ -24,6 +24,7 @@ K_TP = 3.0                      # 停利 ATR 倍數
 RISK_PER_TRADE_PCT = 1.0        # 單筆風險占總資金 %（空頭體制會減半）
 MAX_POSITION_PCT = 10.0         # 單檔部位上限 %
 MARKET_PROXY_ID = '0050'        # FinMind 的 taiwan_stock_daily 沒有加權指數代碼，改用追蹤大盤的 0050 ETF 代理
+CANDIDATE_POOL_SIZE = 150       # 全市場動態選股：依當日成交量取前 N 名進入深度多因子評分（越大越接近全市場，但執行時間與 API 用量也越高）
 
 # FinMind Token 一律從環境變數讀取（GitHub Actions 用 repo secret 注入），不再寫死於程式碼中
 dl = DataLoader()
@@ -267,8 +268,9 @@ def detect_market_regime():
     except Exception:
         return 'NORMAL', 0.0
 
-def get_market_active_stocks():
-    default_pool = {
+def _fallback_stock_pool():
+    # 動態全市場抓取失敗時的備援清單，不是主要選股邏輯
+    return {
         '2330': '台積電', '2317': '鴻海',   '2454': '聯發科', '2308': '台達電',
         '2382': '廣達',   '3231': '緯創',   '2356': '英業達', '2603': '長榮',
         '2609': '陽明',   '2615': '萬海',   '2303': '聯電',   '3037': '欣興',
@@ -277,18 +279,59 @@ def get_market_active_stocks():
         '2881': '富邦金', '2882': '國泰金', '2891': '中信金', '5871': '中租-KY',
         '3017': '奇鋐',   '6669': '緯穎',   '3324': '雙鴻',   '3443': '創意'
     }
+
+def get_market_active_stocks():
+    """全市場動態選股：抓當日全市場成交量快照，取活躍度前 CANDIDATE_POOL_SIZE 名進入深度評分。
+    只需要 1 次 API call 取得全市場快照，深度評分（4 次 call/股）只對篩選後的候選名單執行，
+    藉此在合理執行時間與 API 額度內做到「全市場」而非固定名單。"""
     try:
-        stock_info = dl.taiwan_stock_info()
-        time.sleep(0.1)
-        if not stock_info.empty:
-            stock_info = stock_info[stock_info['type'] == 'twse']
-            stock_info = stock_info[stock_info['stock_id'].str.len() == 4]
-            valid_ids = set(stock_info['stock_id'].tolist())
-            filtered_pool = {k: v for k, v in default_pool.items() if k in valid_ids}
-            return filtered_pool if filtered_pool else default_pool
+        # 目前安裝的 FinMind 版本沒有專門的全市場單日快照方法，改用 stock_id='' 查全市場，
+        # 用短天期窗口（最近 5 天，取最新一天）避免當天盤後資料還沒出爐時抓不到東西，
+        # 也避免抓到過長的歷史區間拖慢執行速度。
+        recent_start = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        df_all = dl.taiwan_stock_daily(stock_id='', start_date=recent_start, end_date=today_str)
+        time.sleep(0.15)
+
+        if df_all.empty or 'stock_id' not in df_all.columns or 'date' not in df_all.columns:
+            return _fallback_stock_pool()
+
+        latest_date = df_all['date'].max()
+        df_latest = df_all[df_all['date'] == latest_date].copy()
+        df_latest['Trading_Volume'] = pd.to_numeric(df_latest.get('Trading_Volume'), errors='coerce')
+        df_latest = df_latest.dropna(subset=['Trading_Volume'])
+
+        df_latest = df_latest[df_latest['stock_id'].str.len() == 4]
+        df_latest = df_latest[df_latest['stock_id'].str.isdigit()]
+
+        name_map = {}
+        try:
+            stock_info = dl.taiwan_stock_info()
+            time.sleep(0.15)
+            if not stock_info.empty:
+                stock_info = stock_info.drop_duplicates('stock_id')
+                if 'industry_category' in stock_info.columns:
+                    etf_ids = set(stock_info[
+                        stock_info['industry_category'].astype(str).str.contains('ETF', case=False, na=False)
+                    ]['stock_id'])
+                    df_latest = df_latest[~df_latest['stock_id'].isin(etf_ids)]
+                name_map = stock_info.set_index('stock_id')['stock_name'].to_dict()
+        except Exception:
+            pass
+
+        if df_latest.empty:
+            return _fallback_stock_pool()
+
+        df_top = df_latest.sort_values(by='Trading_Volume', ascending=False).head(CANDIDATE_POOL_SIZE)
+
+        pool = {}
+        for _, row in df_top.iterrows():
+            sid = row['stock_id']
+            pool[sid] = name_map.get(sid, row.get('stock_name', sid))
+
+        return pool if pool else _fallback_stock_pool()
     except Exception:
-        pass
-    return default_pool
+        return _fallback_stock_pool()
 
 # ==========================================
 # 三大因子群評分（規格書第 2 節）：每個函式回傳 (分數, 細節 dict)，
