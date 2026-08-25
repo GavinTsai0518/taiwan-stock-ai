@@ -7,13 +7,23 @@ import os
 import sys
 from datetime import datetime, timedelta
 from FinMind.data import DataLoader
-from sklearn.ensemble import RandomForestClassifier, VotingClassifier
-from xgboost import XGBClassifier
-from lightgbm import LGBMClassifier
 
 warnings.filterwarnings('ignore')
 
 DB_NAME = "paper_trading.db"
+
+# ===== 可調參數（依「AI 選股引擎規格書」第 9 節建議預設值，之後可依實戰結果調整）=====
+WEIGHT_TECH = 0.4
+WEIGHT_FUND = 0.3
+WEIGHT_CHIP = 0.3
+ENTRY_SCORE_THRESHOLD = 70      # 一般/多頭體制進場總分門檻
+BEAR_SCORE_THRESHOLD = 80       # 空頭體制進場總分門檻（提高）
+MIN_FACTOR_SCORE = 40           # 三因子單項一票否決門檻
+K_SL = 1.75                     # 停損 ATR 倍數（規格建議 1.5~2.0，取中間值）
+K_TP = 3.0                      # 停利 ATR 倍數
+RISK_PER_TRADE_PCT = 1.0        # 單筆風險占總資金 %（空頭體制會減半）
+MAX_POSITION_PCT = 10.0         # 單檔部位上限 %
+MARKET_PROXY_ID = '0050'        # FinMind 的 taiwan_stock_daily 沒有加權指數代碼，改用追蹤大盤的 0050 ETF 代理
 
 # FinMind Token 一律從環境變數讀取（GitHub Actions 用 repo secret 注入），不再寫死於程式碼中
 dl = DataLoader()
@@ -51,17 +61,78 @@ def init_db():
             revenue_yoy REAL,
             pe_ratio REAL,
             position_size REAL DEFAULT 0.0,
-            market_regime TEXT DEFAULT 'NORMAL'
+            market_regime TEXT DEFAULT 'NORMAL',
+            trailing_stop_price REAL,
+            entry_atr REAL
         )
     ''')
+    # 舊資料庫可能沒有這兩個欄位，用 ALTER TABLE 補上（欄位已存在時忽略錯誤）
+    for col_sql in ("ALTER TABLE predictions ADD COLUMN trailing_stop_price REAL",
+                     "ALTER TABLE predictions ADD COLUMN entry_atr REAL"):
+        try:
+            cursor.execute(col_sql)
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     conn.close()
 
+def get_atr14(df):
+    tr = pd.concat([
+        df['High'] - df['Low'],
+        (df['High'] - df['Close'].shift(1)).abs(),
+        (df['Low'] - df['Close'].shift(1)).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(14).mean()
+
+# ==========================================
+# 訊號失效判斷（技術面死亡交叉 / 籌碼面連續賣超），用於「依訊號動態出場」
+# ==========================================
+def check_signal_invalid(stock_id):
+    start_date = (datetime.now() - timedelta(days=60)).strftime('%Y-%m-%d')
+    try:
+        df = dl.taiwan_stock_daily(stock_id=stock_id, start_date=start_date)
+        time.sleep(0.1)
+    except Exception:
+        return False, ""
+
+    if df.empty or len(df) < 25:
+        return False, ""
+
+    df = df.rename(columns={'close': 'Close'})
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date').reset_index(drop=True)
+
+    ma5 = df['Close'].rolling(5).mean()
+    ma20 = df['Close'].rolling(20).mean()
+    if ma5.notna().sum() >= 2 and ma20.notna().sum() >= 2:
+        if ma5.iloc[-2] >= ma20.iloc[-2] and ma5.iloc[-1] < ma20.iloc[-1]:
+            return True, "訊號轉空出場 (MA5 死亡交叉跌破 MA20)"
+
+    try:
+        df_chip = dl.taiwan_stock_institutional_investors(stock_id=stock_id, start_date=start_date)
+        time.sleep(0.1)
+        if not df_chip.empty:
+            foreign_net = df_chip[df_chip['name'] == 'Foreign_Investor'].groupby('date')['buy'].sum() - \
+                          df_chip[df_chip['name'] == 'Foreign_Investor'].groupby('date')['sell'].sum()
+            trust_net = df_chip[df_chip['name'] == 'Investment_Trust'].groupby('date')['buy'].sum() - \
+                        df_chip[df_chip['name'] == 'Investment_Trust'].groupby('date')['sell'].sum()
+            combined = foreign_net.add(trust_net, fill_value=0).sort_index()
+            last3 = combined.tail(3)
+            if len(last3) == 3 and (last3 < 0).all():
+                return True, "訊號轉空出場 (三大法人連續 3 日賣超)"
+    except Exception:
+        pass
+
+    return False, ""
+
+# ==========================================
+# 結算與追蹤：ATR 移動停利 + 訊號失效出場（操作週期不固定，依訊號動態調整）
+# ==========================================
 def audit_past_predictions():
     init_db()
     conn = sqlite3.connect(DB_NAME)
     pending_df = pd.read_sql("SELECT * FROM predictions WHERE status='PENDING'", conn)
-    
+
     if pending_df.empty:
         conn.close()
         return
@@ -70,8 +141,21 @@ def audit_past_predictions():
     cursor = conn.cursor()
 
     for _, row in pending_df.iterrows():
-        p_id, stock_id, p_date = row['id'], row['stock_id'], row['predict_date']
-        tp_price, sl_price = row['tp_price'], row['sl_price']
+        p_id = row['id']
+        stock_id = row['stock_id']
+        p_date = row['predict_date']
+        buy_price = row['buy_price']
+        tp_price = row['tp_price']
+        original_sl = row['sl_price']
+
+        entry_atr = row.get('entry_atr')
+        if pd.isna(entry_atr) or not entry_atr:
+            # 舊資料沒存 entry_atr，用 K_TP 反推估計（僅適用於 K_TP 常數未被調整過的舊倉位）
+            entry_atr = (tp_price - buy_price) / K_TP if (tp_price and buy_price) else None
+
+        current_stop = row.get('trailing_stop_price')
+        if pd.isna(current_stop) or not current_stop:
+            current_stop = original_sl
 
         try:
             df_real = dl.taiwan_stock_daily(stock_id=stock_id, start_date=p_date)
@@ -86,23 +170,42 @@ def audit_past_predictions():
         if df_future.empty:
             continue
 
-        max_p = df_future['max'].max()
-        min_p = df_future['min'].min()
-        
+        running_high = df_future['max'].max()
+        running_low = df_future['min'].min()
+
+        # ATR 移動停利：漲超過 1 倍 ATR 先保本，之後每漲 1 倍 ATR 停損同步上移 1 倍 ATR
+        if entry_atr and entry_atr > 0:
+            n = int((running_high - buy_price) // entry_atr)
+            if n >= 1:
+                candidate_stop = buy_price + (n - 1) * entry_atr
+                current_stop = max(current_stop, candidate_stop, original_sl)
+
         status = 'PENDING'
-        if max_p >= tp_price:
+        if running_high >= tp_price:
             status = 'WIN (成功停利)'
-        elif min_p <= sl_price:
-            status = 'LOSS (觸及停損)'
-        elif len(df_future) >= 5:
-            status = 'EXPIRED (過期平倉)'
+        elif running_low <= current_stop:
+            status = 'LOSS (觸及停損)' if current_stop <= original_sl + 1e-6 else 'WIN (移動停利出場)'
+        else:
+            invalid, reason = check_signal_invalid(stock_id)
+            if invalid:
+                last_close = df_future['close'].iloc[-1] if 'close' in df_future.columns else None
+                if last_close is None:
+                    status = 'EXPIRED (訊號出場)'
+                elif last_close > buy_price:
+                    status = 'WIN (訊號出場)'
+                elif last_close < buy_price:
+                    status = 'LOSS (訊號出場)'
+                else:
+                    status = 'EXPIRED (訊號出場)'
 
         if status != 'PENDING':
             cursor.execute('''
-                UPDATE predictions 
-                SET status=?, real_max_price=?, real_min_price=?, validated_date=?
+                UPDATE predictions
+                SET status=?, real_max_price=?, real_min_price=?, validated_date=?, trailing_stop_price=?
                 WHERE id=?
-            ''', (status, max_p, min_p, today_str, p_id))
+            ''', (status, running_high, running_low, today_str, current_stop, p_id))
+        else:
+            cursor.execute('UPDATE predictions SET trailing_stop_price=? WHERE id=?', (current_stop, p_id))
 
     conn.commit()
     conn.close()
@@ -110,11 +213,11 @@ def audit_past_predictions():
 def detect_market_regime():
     start_date = (datetime.now() - timedelta(days=120)).strftime('%Y-%m-%d')
     try:
-        df_market = dl.taiwan_stock_daily(stock_id='0050', start_date=start_date)
+        df_market = dl.taiwan_stock_daily(stock_id=MARKET_PROXY_ID, start_date=start_date)
         time.sleep(0.1)
         if df_market.empty or len(df_market) < 30:
             return 'NORMAL', 0.0
-        
+
         df_market = df_market.rename(columns={'close': 'Close'})
         sma_20 = df_market['Close'].rolling(20).mean().iloc[-1]
         sma_60 = df_market['Close'].rolling(60).mean().iloc[-1] if len(df_market) >= 60 else sma_20
@@ -122,59 +225,17 @@ def detect_market_regime():
 
         if latest_close < sma_20 and sma_20 < sma_60:
             regime = 'BEAR'
-            print("🚨 [大盤體制模组] 偵測到大盤處於『空頭/高風險體制』(收盤價跌破月線/季線)！啟動全面防守降倉。")
+            print("🚨 [大盤體制模組] 大盤處於『空頭/高風險體制』，進場門檻提高、單筆風險減半。")
         elif latest_close > sma_20 and sma_20 > sma_60:
             regime = 'BULL'
-            print("🟢 [大盤體制模組] 大盤處於『強勢多頭體制』，系統維持常態/順勢攻擊選股。")
+            print("🟢 [大盤體制模組] 大盤處於『強勢多頭體制』，維持常態選股。")
         else:
             regime = 'NORMAL'
             print("🟡 [大盤體制模組] 大盤處於『震盪整理體制』，採用標準風控機制。")
-            
+
         return regime, round(latest_close, 2)
     except Exception:
         return 'NORMAL', 0.0
-
-def get_bayesian_adaptive_threshold(market_regime):
-    conn = sqlite3.connect(DB_NAME)
-    df_history = pd.read_sql("SELECT status FROM predictions WHERE status!='PENDING' ORDER BY id DESC LIMIT 20", conn)
-    conn.close()
-
-    alpha_prior = 11.6
-    beta_prior = 8.4
-    base_threshold = 0.58
-
-    if df_history.empty or len(df_history) < 5:
-        threshold = base_threshold
-    else:
-        wins = len(df_history[df_history['status'] == 'WIN (成功停利)'])
-        losses = len(df_history[df_history['status'] == 'LOSS (觸及停損)'])
-        bayesian_win_rate = (wins + alpha_prior) / (wins + losses + alpha_prior + beta_prior)
-
-        if bayesian_win_rate < 0.52:
-            threshold = 0.62
-        elif bayesian_win_rate >= 0.62:
-            threshold = 0.56
-        else:
-            threshold = base_threshold
-
-    if market_regime == 'BEAR':
-        threshold = max(threshold, 0.64)
-        print(f"🛡️ [大盤防守疊加] 受空頭體制影響，進場門檻強制提升至: {threshold*100:.1f}%\n")
-    else:
-        print(f"🎯 今日 AI 動態門檻: {threshold*100:.1f}%\n")
-
-    return threshold
-
-def calculate_kelly_position(win_rate_prob, buy_p, tp_p, sl_p):
-    b = (tp_p - buy_p) / (buy_p - sl_p + 1e-6)
-    p = win_rate_prob
-    q = 1.0 - p
-
-    kelly_f = (b * p - q) / (b + 1e-6)
-    half_kelly = max(0.0, kelly_f / 2.0)
-    capped_position = min(0.15, half_kelly)
-    
-    return round(capped_position * 100, 1)
 
 def get_market_active_stocks():
     default_pool = {
@@ -199,19 +260,133 @@ def get_market_active_stocks():
         pass
     return default_pool
 
+# ==========================================
+# 三大因子群評分（規格書第 2 節）
+# ==========================================
+def score_technical(df):
+    if len(df) < 60:
+        return None
+    close = df['Close']
+    ma5 = close.rolling(5).mean()
+    ma20 = close.rolling(20).mean()
+    ma60 = close.rolling(60).mean()
+    if pd.isna(ma60.iloc[-1]):
+        return None
+
+    c, m5, m20, m60 = close.iloc[-1], ma5.iloc[-1], ma20.iloc[-1], ma60.iloc[-1]
+
+    if m5 > m20 > m60:
+        s_trend = 100.0
+    elif m5 > m20:
+        s_trend = 60.0
+    else:
+        s_trend = 0.0
+
+    bias = (c - m20) / m20 * 100
+    if bias <= 0:
+        s_bias = max(0.0, 50 + bias * 10)
+    elif bias <= 5:
+        s_bias = 50 + bias * 10
+    else:
+        s_bias = max(0.0, 100 - (bias - 5) * 10)
+
+    vol = df['Volume']
+    vol_ma20 = vol.rolling(20).mean().iloc[-1]
+    vol_ratio = vol.iloc[-1] / (vol_ma20 + 1e-6)
+    is_red = close.iloc[-1] > df['Open'].iloc[-1]
+    if vol_ratio >= 1.2 and is_red:
+        s_vol = 100.0
+    elif is_red:
+        s_vol = min(100.0, vol_ratio / 1.2 * 100) * 0.6
+    else:
+        s_vol = min(60.0, vol_ratio / 1.2 * 60)
+
+    ret5 = close.pct_change(5)
+    window = ret5.tail(252).dropna()
+    if len(window) >= 20:
+        s_mom = float((window <= ret5.iloc[-1]).mean() * 100)
+    else:
+        s_mom = 50.0
+
+    return round((s_trend + s_bias + s_vol + s_mom) / 4, 1)
+
+def score_fundamental(yoy, mom_turned_positive, per_series):
+    if yoy is None or pd.isna(yoy):
+        s_yoy = 50.0
+    elif yoy > 30:
+        s_yoy = 100.0
+    elif yoy >= 10:
+        s_yoy = 70.0
+    elif yoy >= 0:
+        s_yoy = 50.0
+    else:
+        s_yoy = max(0.0, 30 + yoy)
+    if mom_turned_positive:
+        s_yoy = min(100.0, s_yoy + 20)
+
+    per_clean = per_series.dropna()
+    per_window = per_clean.tail(756)  # 約 3 年交易日
+    current_per = per_clean.iloc[-1] if not per_clean.empty else None
+    if current_per is not None and len(per_window) >= 60:
+        percentile = float((per_window <= current_per).mean() * 100)
+        if percentile <= 20:
+            s_val = 100.0
+        elif percentile >= 80:
+            s_val = 0.0
+        else:
+            s_val = 100 - (percentile - 20) * (100 / 60)
+    else:
+        s_val = 50.0
+
+    return round(s_yoy * 0.55 + s_val * 0.45, 1)
+
+def score_chip(foreign_net, trust_net, volume):
+    def streak_score(net_series):
+        recent = net_series.tail(10)
+        streak = 0
+        for v in recent.iloc[::-1]:
+            if v > 0:
+                streak += 1
+            else:
+                break
+        return min(100.0, streak / 5 * 100)
+
+    s_foreign = streak_score(foreign_net)
+    s_trust = streak_score(trust_net)
+
+    combined_5d = foreign_net.tail(5).sum() + trust_net.tail(5).sum()
+    volume_5d = volume.tail(5).sum()
+    ratio = combined_5d / (volume_5d + 1e-6)  # 用股數比例代替金額比例（FinMind 籌碼資料為股數，非金額）
+    s_strength = max(0.0, min(100.0, ratio / 0.1 * 100))
+
+    return round(s_foreign * 0.3 + s_trust * 0.4 + s_strength * 0.3, 1)
+
+def calculate_position_size(buy_price, sl_price, risk_pct):
+    sl_pct = (buy_price - sl_price) / buy_price
+    if sl_pct <= 0:
+        return 0.0
+    return round(min(risk_pct / sl_pct, MAX_POSITION_PCT), 1)
+
 def main():
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 啟動 AI 量化選股系統 (Token 驗證版)...")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 啟動 AI 多因子選股系統...")
     audit_past_predictions()
-    
+
     market_regime, _ = detect_market_regime()
-    adaptive_threshold = get_bayesian_adaptive_threshold(market_regime)
-    
+    if market_regime == 'BEAR':
+        score_threshold = BEAR_SCORE_THRESHOLD
+        risk_pct = RISK_PER_TRADE_PCT / 2
+    else:
+        score_threshold = ENTRY_SCORE_THRESHOLD
+        risk_pct = RISK_PER_TRADE_PCT
+    print(f"🎯 今日進場總分門檻: {score_threshold} 分 ｜ 單筆風險: {risk_pct}% 總資金\n")
+
     dynamic_stock_pool = get_market_active_stocks()
-    print(f"✅ 鎖定 {len(dynamic_stock_pool)} 支熱門標的，開始執行量化分析...\n")
+    print(f"✅ 鎖定 {len(dynamic_stock_pool)} 支熱門標的，開始執行多因子評分...\n")
 
     today_str = datetime.now().strftime('%Y-%m-%d')
-    start_date = (datetime.now() - timedelta(days=210)).strftime('%Y-%m-%d')
-    
+    start_date = (datetime.now() - timedelta(days=400)).strftime('%Y-%m-%d')      # 動能百分位需要約 1 年資料
+    per_start_date = (datetime.now() - timedelta(days=1150)).strftime('%Y-%m-%d')  # 估值河流位階需要約 3 年資料
+
     init_db()
     conn = sqlite3.connect(DB_NAME)
     results = []
@@ -220,164 +395,110 @@ def main():
         try:
             df = dl.taiwan_stock_daily(stock_id=stock_id, start_date=start_date)
             time.sleep(0.15)
-            if df.empty or len(df) < 50:
+            if df.empty or len(df) < 60:
                 continue
-            df = df.rename(columns={'max': 'High', 'min': 'Low', 'close': 'Close', 'Trading_Volume': 'Volume'})
+            df = df.rename(columns={'max': 'High', 'min': 'Low', 'close': 'Close',
+                                     'open': 'Open', 'Trading_Volume': 'Volume'})
             df['date'] = pd.to_datetime(df['date'])
             df = df.sort_values('date').reset_index(drop=True)
 
-            # 籌碼面
+            # 籌碼面：三大法人買賣超
             df_chip = dl.taiwan_stock_institutional_investors(stock_id=stock_id, start_date=start_date)
             time.sleep(0.15)
             if not df_chip.empty:
-                foreign_buy = df_chip[df_chip['name'] == 'Foreign_Investor'].groupby('date')['buy'].sum() - \
-                              df_chip[df_chip['name'] == 'Foreign_Investor'].groupby('date')['sell'].sum()
-                trust_buy = df_chip[df_chip['name'] == 'Investment_Trust'].groupby('date')['buy'].sum() - \
-                            df_chip[df_chip['name'] == 'Investment_Trust'].groupby('date')['sell'].sum()
-                df['Foreign_Buy'] = df['date'].dt.strftime('%Y-%m-%d').map(foreign_buy).fillna(0)
-                df['Trust_Buy'] = df['date'].dt.strftime('%Y-%m-%d').map(trust_buy).fillna(0)
+                foreign_net_by_date = df_chip[df_chip['name'] == 'Foreign_Investor'].groupby('date')['buy'].sum() - \
+                                      df_chip[df_chip['name'] == 'Foreign_Investor'].groupby('date')['sell'].sum()
+                trust_net_by_date = df_chip[df_chip['name'] == 'Investment_Trust'].groupby('date')['buy'].sum() - \
+                                    df_chip[df_chip['name'] == 'Investment_Trust'].groupby('date')['sell'].sum()
+                date_key = df['date'].dt.strftime('%Y-%m-%d')
+                df['Foreign_Buy'] = date_key.map(foreign_net_by_date).fillna(0)
+                df['Trust_Buy'] = date_key.map(trust_net_by_date).fillna(0)
             else:
-                df['Foreign_Buy'], df['Trust_Buy'] = 0, 0
+                df['Foreign_Buy'], df['Trust_Buy'] = 0.0, 0.0
 
-            # 基本面
+            # 基本面：月營收 YoY / MoM 轉正
+            latest_yoy = None
+            mom_turned_positive = False
             try:
                 df_rev = dl.taiwan_stock_month_revenue(stock_id=stock_id, start_date=start_date)
                 time.sleep(0.1)
-                if not df_rev.empty and 'revenue_year_growth_ratio' in df_rev.columns:
-                    df_rev['announce_date'] = pd.to_datetime(
-                        df_rev['revenue_year'].astype(str) + '-' + 
-                        df_rev['revenue_month'].astype(str).str.zfill(2) + '-10'
-                    )
-                    df_rev = df_rev.sort_values('announce_date')
-                    df = pd.merge_asof(df, df_rev[['announce_date', 'revenue_year_growth_ratio']], 
-                                      left_on='date', right_on='announce_date', direction='backward')
-                    df['Revenue_YoY'] = df['revenue_year_growth_ratio'].fillna(0)
-                    if df['Revenue_YoY'].abs().max() < 5.0 and df['Revenue_YoY'].abs().max() > 0:
-                        df['Revenue_YoY'] = df['Revenue_YoY'] * 100
-                else:
-                    df['Revenue_YoY'] = 0.0
+                if not df_rev.empty and 'revenue' in df_rev.columns:
+                    df_rev = df_rev.sort_values(['revenue_year', 'revenue_month']).reset_index(drop=True)
+                    mom = df_rev['revenue'].pct_change()
+                    if len(mom) >= 2:
+                        mom_turned_positive = bool(mom.iloc[-2] < 0 and mom.iloc[-1] > 0)
+                    if 'revenue_year_growth_ratio' in df_rev.columns and not df_rev['revenue_year_growth_ratio'].dropna().empty:
+                        latest_yoy = float(df_rev['revenue_year_growth_ratio'].dropna().iloc[-1])
+                        if 0 < abs(latest_yoy) < 5.0:
+                            latest_yoy *= 100
             except Exception:
-                df['Revenue_YoY'] = 0.0
+                pass
 
+            # 基本面：估值河流位階（近 3 年 PE 百分位）
+            per_series = pd.Series(dtype=float)
+            latest_per = None
             try:
-                df_per = dl.taiwan_stock_per_pbr(stock_id=stock_id, start_date=start_date)
+                df_per = dl.taiwan_stock_per_pbr(stock_id=stock_id, start_date=per_start_date)
                 time.sleep(0.1)
                 if not df_per.empty and 'PER' in df_per.columns:
-                    df_per['date'] = pd.to_datetime(df_per['date'])
-                    df = pd.merge(df, df_per[['date', 'PER']], on='date', how='left')
-                    df['PER'] = pd.to_numeric(df['PER'], errors='coerce').fillna(20.0)
-                else:
-                    df['PER'] = 20.0
+                    df_per['PER'] = pd.to_numeric(df_per['PER'], errors='coerce')
+                    per_series = df_per['PER']
+                    per_valid = per_series.dropna()
+                    latest_per = float(per_valid.iloc[-1]) if not per_valid.empty else None
             except Exception:
-                df['PER'] = 20.0
+                pass
 
-            # 第一層硬性過濾
-            latest_yoy = df['Revenue_YoY'].iloc[-1]
-            latest_per = df['PER'].iloc[-1]
-            if latest_yoy < -15.0 or latest_per > 65.0 or latest_per < 0:
+            # 硬性排除：營收嚴重衰退或本益比異常/過高
+            if latest_yoy is not None and latest_yoy < -30.0:
+                continue
+            if latest_per is not None and (latest_per > 80.0 or latest_per < 0):
                 continue
 
-            # 技術指標與 ATR
-            df['SMA_5'] = df['Close'].rolling(5).mean()
-            df['SMA_20'] = df['Close'].rolling(20).mean()
-            df['MA_Diff_5_20'] = (df['SMA_5'] - df['SMA_20']) / df['SMA_20']
-            df['Return_1D'] = df['Close'].pct_change(1)
-            df['Return_5D'] = df['Close'].pct_change(5)
-
-            delta = df['Close'].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-            df['RSI_14'] = 100 - (100 / (1 + (gain / (loss + 1e-6))))
-
-            df['Total_Inst_Buy'] = df['Foreign_Buy'] + df['Trust_Buy']
-            df['Inst_Ratio'] = df['Total_Inst_Buy'] / (df['Volume'] + 1e-6)
-
-            tr = pd.concat([
-                df['High'] - df['Low'],
-                (df['High'] - df['Close'].shift(1)).abs(),
-                (df['Low'] - df['Close'].shift(1)).abs()
-            ], axis=1).max(axis=1)
-            df['ATR_14'] = tr.rolling(14).mean()
-
-            # 三層屏障標籤
-            target_labels = []
-            for i in range(len(df)):
-                if i + 3 >= len(df):
-                    target_labels.append(np.nan)
-                    continue
-                
-                entry_p = df['Close'].iloc[i]
-                current_atr = df['ATR_14'].iloc[i]
-                if pd.isna(current_atr) or current_atr <= 0:
-                    current_atr = entry_p * 0.02
-
-                upper_barrier = entry_p + (1.8 * current_atr)
-                lower_barrier = entry_p - (1.0 * current_atr)
-
-                future_window = df.iloc[i+1 : i+4]
-                first_touch = 0
-
-                for _, f_row in future_window.iterrows():
-                    if f_row['High'] >= upper_barrier:
-                        first_touch = 1
-                        break
-                    elif f_row['Low'] <= lower_barrier:
-                        first_touch = -1
-                        break
-                
-                target_labels.append(1 if first_touch == 1 else 0)
-
-            df['Target'] = target_labels
-
-            df_clean = df.dropna().copy()
-            if len(df_clean) < 30:
+            tech_score = score_technical(df)
+            if tech_score is None:
                 continue
+            fund_score = score_fundamental(latest_yoy, mom_turned_positive, per_series)
+            chip_score = score_chip(df['Foreign_Buy'], df['Trust_Buy'], df['Volume'])
 
-            features = ['MA_Diff_5_20', 'Return_1D', 'Return_5D', 'RSI_14', 'Inst_Ratio', 'Revenue_YoY', 'PER']
-            X, y = df_clean[features], df_clean['Target']
-
-            if len(y.unique()) < 2:
-                continue
-
-            clf1 = XGBClassifier(n_estimators=40, learning_rate=0.03, max_depth=3, random_state=42)
-            clf2 = LGBMClassifier(n_estimators=40, learning_rate=0.03, max_depth=3, random_state=42, verbose=-1)
-            clf3 = RandomForestClassifier(n_estimators=40, max_depth=3, random_state=42)
-            
-            ensemble_model = VotingClassifier(estimators=[('xgb', clf1), ('lgb', clf2), ('rf', clf3)], voting='soft')
-            ensemble_model.fit(X, y)
-
-            up_prob = ensemble_model.predict_proba(X.tail(1))[0][1]
+            total_score = round(tech_score * WEIGHT_TECH + fund_score * WEIGHT_FUND + chip_score * WEIGHT_CHIP, 1)
+            passed = total_score >= score_threshold and min(tech_score, fund_score, chip_score) >= MIN_FACTOR_SCORE
 
             latest_price = round(float(df['Close'].iloc[-1]), 2)
-            latest_atr = df['ATR_14'].iloc[-1] if not pd.isna(df['ATR_14'].iloc[-1]) else latest_price * 0.02
+            atr_series = get_atr14(df)
+            latest_atr = atr_series.iloc[-1] if pd.notna(atr_series.iloc[-1]) else latest_price * 0.02
 
             buy_price = latest_price
-            tp_price = round(buy_price + (1.8 * latest_atr), 2)
-            sl_price = round(buy_price - (1.0 * latest_atr), 2)
+            sl_price = round(buy_price - K_SL * latest_atr, 2)
+            tp_price = round(buy_price + K_TP * latest_atr, 2)
+            pos_size = calculate_position_size(buy_price, sl_price, risk_pct)
 
-            pos_size = calculate_kelly_position(up_prob, buy_price, tp_price, sl_price)
+            status_label = "🔥 建議買進" if passed else "☁️ 觀望"
 
-            status = "🔥 建議買進" if up_prob >= adaptive_threshold else "☁️ 觀望"
-
-            if up_prob >= adaptive_threshold:
-                check_df = pd.read_sql(f"SELECT * FROM predictions WHERE predict_date='{today_str}' AND stock_id='{stock_id}'", conn)
+            if passed:
+                check_df = pd.read_sql(
+                    "SELECT id FROM predictions WHERE predict_date=? AND stock_id=?",
+                    conn, params=(today_str, stock_id)
+                )
                 if check_df.empty:
                     cursor = conn.cursor()
                     cursor.execute('''
-                        INSERT INTO predictions (predict_date, stock_id, stock_name, latest_price, buy_price, tp_price, sl_price, ai_win_rate, revenue_yoy, pe_ratio, position_size, market_regime)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (today_str, stock_id, name, latest_price, buy_price, tp_price, sl_price, round(up_prob * 100, 1), round(latest_yoy, 1), round(latest_per, 1), pos_size, market_regime))
+                        INSERT INTO predictions
+                        (predict_date, stock_id, stock_name, latest_price, buy_price, tp_price, sl_price,
+                         ai_win_rate, revenue_yoy, pe_ratio, position_size, market_regime,
+                         trailing_stop_price, entry_atr)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (today_str, stock_id, name, latest_price, buy_price, tp_price, sl_price,
+                          total_score,
+                          round(latest_yoy, 1) if latest_yoy is not None else None,
+                          round(latest_per, 1) if latest_per is not None else None,
+                          pos_size, market_regime, sl_price, round(float(latest_atr), 4)))
 
             results.append({
-                '股票代碼': stock_id,
-                '股票名稱': name,
-                '最新收盤價': latest_price,
-                'AI 勝率(%)': round(up_prob * 100, 1),
-                '建議部位(%)': pos_size,
-                '決策建議': status,
-                '建議買入價': buy_price,
-                '建議停利價 (ATR)': tp_price,
-                '建議停損價 (ATR)': sl_price
+                '股票代碼': stock_id, '股票名稱': name, '最新收盤價': latest_price,
+                '技術面': tech_score, '基本面': fund_score, '籌碼面': chip_score,
+                '總分': total_score, '決策建議': status_label,
+                '建議買入價': buy_price, '停利價': tp_price, '停損價': sl_price,
+                '建議部位(%)': pos_size
             })
         except Exception:
             continue
@@ -386,11 +507,10 @@ def main():
     conn.close()
 
     if results:
-        final_df = pd.DataFrame(results)
-        final_df = final_df.sort_values(by='AI 勝率(%)', ascending=False).reset_index(drop=True)
-        print("=== 系統運算結果 (Token 授權版) ===")
+        final_df = pd.DataFrame(results).sort_values(by='總分', ascending=False).reset_index(drop=True)
+        print("=== 多因子評分結果 ===")
         print(final_df.to_string(index=False))
-        print(f"\n✅ 選股與部位計算完成！結果已記錄至 paper_trading.db。")
+        print("\n✅ 選股與部位計算完成！結果已記錄至 paper_trading.db。")
     else:
         print("今日無符合條件標的。")
 
