@@ -24,16 +24,16 @@ except Exception:
 DB_NAME = "paper_trading.db"
 FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoiMDUxOGNoaXl1QGdtYWlsLmNvbSIsImVtYWlsIjoiMDUxOGNoaXl1QGdtYWlsLmNvbSIsInRva2VuX3ZlcnNpb24iOjAsImV4cCI6MTc4ODI0MDUwOH0.dNGO-ZUPpWW30mfiUdwMqIJV-v2bqShtiLJsoy4vh7I"
 
-@st.cache_resource
+# 安全初始化 DataLoader (移除會對 None 建立弱引用的 @st.cache_resource 裝飾器)
 def get_finmind_loader():
     if not HAS_FINMIND:
         return None
-    dl = DataLoader()
     try:
-        dl.login_by_token(token=FINMIND_TOKEN)
+        loader = DataLoader()
+        loader.login_by_token(token=FINMIND_TOKEN)
+        return loader
     except Exception:
-        pass
-    return dl
+        return None
 
 dl = get_finmind_loader()
 
@@ -111,7 +111,7 @@ def get_watchlist():
     except Exception:
         return pd.DataFrame()
 
-# 3. 側邊欄
+# 3. 側邊欄：自選股關注清單管理
 st.sidebar.title("⭐ 個人自選股清單")
 with st.sidebar.form("add_stock_form", clear_on_submit=True):
     new_stock_id = st.text_input("輸入股票代碼 (例: 2330)", "")
@@ -137,7 +137,7 @@ if not df_wl.empty:
 else:
     st.sidebar.info("關注清單為空，請輸入代碼新增股票。")
 
-# 4. 主頁面標題與數據
+# 4. 主頁面標題與數據載入
 st.title("📈 台股 AI 量化智庫與互動視覺化終端")
 st.caption("結合 AI 選股模型、個人自選股清單、動態 K 線圖與法人籌碼/財報圖解")
 
@@ -174,7 +174,7 @@ tab1, tab2, tab3 = st.tabs(["🔥 今日 AI 精選決策", "🔍 個股 K 線 / 
 today_str = datetime.now().strftime('%Y-%m-%d')
 df_today = df_all[df_all['predict_date'] == today_str] if not df_all.empty and 'predict_date' in df_all.columns else pd.DataFrame()
 
-# Tab 1
+# Tab 1: 今日 AI 精選
 with tab1:
     st.subheader(f"🤖 今日 ({today_str}) AI 精選標的與建議")
     if not df_today.empty:
@@ -202,7 +202,7 @@ with tab1:
     else:
         st.info("今日市場經 AI 與風控過濾後無符合進場條件之標的，建議觀望保持現金。")
 
-# Tab 2
+# Tab 2: 視覺化圖表與財報深度分析
 with tab2:
     st.subheader("📊 互動式技術面、籌碼面與基本面圖解")
     stock_options = {}
@@ -274,7 +274,7 @@ with tab2:
                 if not df_rev.empty and 'revenue' in df_rev.columns:
                     st.dataframe(df_rev.tail(5)[['revenue_year', 'revenue_month', 'revenue']], hide_index=True)
 
-# Tab 3
+# Tab 3: 歷史紀錄對照
 with tab3:
     st.subheader("📜 歷史預測紀錄與實戰對照明細")
     if not df_all.empty:
