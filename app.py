@@ -4,10 +4,8 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
-# 設定頁面寬度與標題
 st.set_page_config(page_title="台股 AI 量化智庫儀表板", page_icon="📈", layout="wide")
 
-# 自訂 CSS 提升質感
 st.markdown("""
 <style>
     .metric-card {
@@ -17,15 +15,9 @@ st.markdown("""
         padding: 15px;
         text-align: center;
     }
-    .status-badge {
-        font-weight: bold;
-        padding: 4px 12px;
-        border-radius: 15px;
-        font-size: 14px;
-    }
     .stock-card {
         background-color: #ffffff;
-        border-left: 5px solid #3b82f6;
+        border-left: 5px solid #2563eb;
         border-top: 1px solid #e2e8f0;
         border-right: 1px solid #e2e8f0;
         border-bottom: 1px solid #e2e8f0;
@@ -37,14 +29,12 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📈 台股 AI 量化智庫與實戰解讀儀表板")
-st.caption("結合集成機器學習、動態門檻校正與多因子文字診斷模型")
+st.title("📈 台股 AI 量化智庫與基本面解讀儀表板")
+st.caption("結合集成機器學習、基本面雙層過濾（營收YoY/本益比）與自適應門檻校正機制")
 
 conn = sqlite3.connect("paper_trading.db")
 
-# ==========================================
-# 1. 頂部整體盲測戰績與 AI 策略狀態
-# ==========================================
+# 1. 頂部整體盲測戰績
 df_all = pd.read_sql("SELECT * FROM predictions", conn)
 completed = df_all[df_all['status'] != 'PENDING']
 wins = df_all[df_all['status'] == 'WIN (成功停利)']
@@ -63,9 +53,7 @@ with col3:
 
 st.divider()
 
-# ==========================================
-# 2. 當前市場狀態與 AI 策略氣象燈 (文字解讀)
-# ==========================================
+# 2. AI 策略與氣象燈
 st.subheader("🤖 AI 當前策略與市場氣象診斷")
 
 df_recent = pd.read_sql("SELECT status FROM predictions WHERE status!='PENDING' ORDER BY id DESC LIMIT 20", conn)
@@ -89,19 +77,17 @@ with col_status1:
 with col_status2:
     st.markdown("**🔍 市場環境與 AI 診斷評估**")
     if recent_win_rate < 45.0:
-        st.write("近期市場波動較大或處於震盪洗盤格局，多頭動能延續性較弱。AI 系統已自動**收緊選股標準**，透過提高進場門檻來剔除假突破標的，優先確保資金安全。")
+        st.write("近期市場波動較大，多頭動能延續性較弱。AI 系統已自動**調高門檻並結合基本面硬性濾網**，嚴格過濾無業績支撐的個股以降低風險。")
     elif recent_win_rate >= 65.0:
-        st.write("當前市場多頭趨勢顯著，技術面突破與法人籌碼追價的成功率極高。AI 模型與當前行情高度契合，系統已適度放寬門檻以抓取更多波段爆發標的。")
+        st.write("當前市場多頭趨勢顯著，籌碼與業績雙優標的表現亮眼。AI 系統已適度放寬門檻，積極捕捉波段強勢個股。")
     else:
-        st.write("當前市場結構處於正常多空交替狀態，歷史盲測勝率維持在合理區間。AI 系統採用標準選股門檻，均衡考慮技術面動能與籌碼集中度。")
+        st.write("當前市場結構處於正常多空交替狀態。AI 系統採用標準門檻，均衡考慮技術面動量、法人籌碼與基本面營收表現。")
 
 st.divider()
 
-# ==========================================
-# 3. 今日 AI 精選標的（具體文字解讀卡片）
-# ==========================================
+# 3. 今日 AI 精選標的 (基本面解讀卡片)
 today_str = datetime.now().strftime('%Y-%m-%d')
-st.subheader(f"🔥 今日 ({today_str}) AI 精選標的與決策報告")
+st.subheader(f"🔥 今日 ({today_str}) AI 精選標的與基本面決策報告")
 
 df_today = pd.read_sql(f"SELECT * FROM predictions WHERE predict_date='{today_str}'", conn)
 
@@ -111,83 +97,77 @@ if not df_today.empty:
         downside = round(((row['latest_price'] - row['sl_price']) / row['latest_price']) * 100, 1)
         rr_ratio = round(upside / (downside + 1e-6), 2)
         
+        rev_yoy = row.get('revenue_yoy', 'N/A')
+        pe_val = row.get('pe_ratio', 'N/A')
+
         st.markdown(f"""
         <div class="stock-card">
             <h3 style="margin:0; color:#1e3a8a;">📌 {row['stock_name']} ({row['stock_id']})</h3>
             <p style="margin-top:5px; color:#475569;">
                 <b>最新收盤價：</b> NT$ {row['latest_price']} ｜ 
-                <b>AI 預估看漲勝率：</b> <span style="color:#d97706; font-size:18px; font-weight:bold;">{row['ai_win_rate']}%</span> ｜
-                <b>預期風報比：</b> {rr_ratio} (潛在獲利: +{upside}% / 防守風險: -{downside}%)
+                <b>AI 預估勝率：</b> <span style="color:#d97706; font-size:18px; font-weight:bold;">{row['ai_win_rate']}%</span> ｜
+                <b>營收 YoY：</b> <span style="color:#16a34a; font-weight:bold;">+{rev_yoy}%</span> ｜
+                <b>本益比 (PE)：</b> {pe_val} 倍
             </p>
         </div>
         """, unsafe_allow_html=True)
         
-        with st.expander(f"📖 點擊查看 {row['stock_name']} 的 AI 完整分析報告與操作建議"):
+        with st.expander(f"📖 點擊查看 {row['stock_name']} 的 AI 多維度完整分析報告"):
             col_a, col_b = st.columns(2)
             
             with col_a:
                 st.markdown("**🎯 AI 交易價位建議**")
                 st.write(f"- **建議進場價**：`NT$ {row['buy_price']}` (參考當日收盤價)")
-                st.write(f"- **目標停利價**：`NT$ {row['tp_price']}` (對應前波強壓力線，預期 +{upside}%)")
-                st.write(f"- **防守停損價**：`NT$ {row['sl_price']}` (對應近 20 日強支撐，風險 -{downside}%)")
+                st.write(f"- **目標停利價**：`NT$ {row['tp_price']}` (預期 +{upside}%)")
+                st.write(f"- **防守停損價**：`NT$ {row['sl_price']}` (風險 -{downside}%)")
             
             with col_b:
-                st.markdown("**💡 AI 決策邏輯與模型觀點**")
-                st.write(f"- **強度評估**：模型預估該股未來 3 個交易日內上漲超過 1.5% 的機率高達 **{row['ai_win_rate']}%**。")
-                st.write("- **特徵綜合判斷**：均線呈多頭排列，短線動能顯著增強，同時外資與投信籌碼出現集中流入跡象，符合高勝率攻擊型態。")
-                st.write("- **操作戰術建議**：建議於開盤附近佈局，若股價順利突破目標價可分批獲利入袋；若回檔跌破支撐價位則嚴格執行停損退場。")
+                st.markdown("**💡 AI 基本面與籌碼邏輯**")
+                st.write(f"- **業績成長**：最新營收年增率為 **+{rev_yoy}%**，展現明確本業基本面支撐。")
+                st.write(f"- **估值安全度**：當前本益比為 **{pe_val} 倍**，位於合理估值區間。")
+                st.write(f"- **綜合評價**：模型評估該股兼具「營收成長、技術突破與籌碼集中」三大特性，看漲勝率達 **{row['ai_win_rate']}%**。")
             
             st.write("---")
 else:
-    st.info("今日市場經 AI 綜合評估後，無勝率符合當前自適應門檻之標的，或今日盤後數據尚未更新。")
+    st.info("今日市場經 AI 與基本面雙重過濾後，無符合條件標的，或今日盤後數據尚未更新。")
 
 st.divider()
 
-# ==========================================
-# 4. 歷史盲測戰績全紀錄 (美化修正版)
-# ==========================================
+# 4. 歷史明細紀錄
 st.subheader("📜 歷史預測紀錄與實戰對照明細")
 
 if not df_all.empty:
-    # 進行欄位挑選、排序與中文美化
     df_display = df_all.sort_values(by='id', ascending=False).copy()
     
-    # 重新命名欄位
     rename_dict = {
         'predict_date': '預測日期',
         'stock_id': '股票代碼',
         'stock_name': '股票名稱',
         'latest_price': '最新收盤價',
+        'revenue_yoy': '營收YoY(%)',
+        'pe_ratio': '本益比(PE)',
         'buy_price': '建議買價',
         'tp_price': '停利價',
         'sl_price': '停損價',
-        'ai_win_rate': 'AI預估勝率(%)',
+        'ai_win_rate': 'AI勝率(%)',
         'status': '驗證狀態',
-        'real_max_price': '對照期間最高價',
-        'real_min_price': '對照期間最低價',
-        'validated_date': '結算驗證日期'
+        'validated_date': '結算日期'
     }
     
-    # 選取需要顯示的欄位並更名 (隱藏 id 欄位)
     display_cols = [c for c in rename_dict.keys() if c in df_display.columns]
     df_display = df_display[display_cols].rename(columns=rename_dict)
     
-    # 使用 Streamlit 原生 Column Config 進行格式化與美化渲染
     st.dataframe(
         df_display,
         use_container_width=True,
-        hide_index=True,  # 隱藏左側索引列
+        hide_index=True,
         column_config={
-            "AI預估勝率(%)": st.column_config.NumberColumn(format="%.1f%%"),
+            "AI勝率(%)": st.column_config.NumberColumn(format="%.1f%%"),
             "最新收盤價": st.column_config.NumberColumn(format="NT$ %.2f"),
             "建議買價": st.column_config.NumberColumn(format="NT$ %.2f"),
             "停利價": st.column_config.NumberColumn(format="NT$ %.2f"),
             "停損價": st.column_config.NumberColumn(format="NT$ %.2f"),
-            "對照期間最高價": st.column_config.NumberColumn(format="NT$ %.2f"),
-            "對照期間最低價": st.column_config.NumberColumn(format="NT$ %.2f"),
         }
     )
-else:
-    st.write("目前資料庫中尚未有歷史預測紀錄。")
 
 conn.close()
