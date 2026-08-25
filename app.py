@@ -51,7 +51,7 @@ def get_finmind_loader(token):
         return None
     try:
         loader = DataLoader()
-        loader.login_by_token(token=token)
+        loader.login_by_token(api_token=token)
         st.sidebar.success("✅ FinMind 資料源連線成功")
         return loader
     except Exception as e:
