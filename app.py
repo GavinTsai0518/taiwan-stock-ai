@@ -24,7 +24,7 @@ except Exception:
 DB_NAME = "paper_trading.db"
 FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoiMDUxOGNoaXl1QGdtYWlsLmNvbSIsImVtYWlsIjoiMDUxOGNoaXl1QGdtYWlsLmNvbSIsInRva2VuX3ZlcnNpb24iOjAsImV4cCI6MTc4ODI0MDUwOH0.dNGO-ZUPpWW30mfiUdwMqIJV-v2bqShtiLJsoy4vh7I"
 
-# 安全初始化 DataLoader（絕不使用 @st.cache_resource，防止回傳 None 時引發 Weak Reference 錯誤）
+# 安全初始化 DataLoader（絕不使用快取裝飾器）
 def get_finmind_loader():
     if not HAS_FINMIND:
         return None
