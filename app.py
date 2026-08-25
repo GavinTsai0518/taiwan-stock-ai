@@ -24,7 +24,7 @@ except Exception:
 DB_NAME = "paper_trading.db"
 FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoiMDUxOGNoaXl1QGdtYWlsLmNvbSIsImVtYWlsIjoiMDUxOGNoaXl1QGdtYWlsLmNvbSIsInRva2VuX3ZlcnNpb24iOjAsImV4cCI6MTc4ODI0MDUwOH0.dNGO-ZUPpWW30mfiUdwMqIJV-v2bqShtiLJsoy4vh7I"
 
-# 安全初始化 DataLoader (移除會對 None 建立弱引用的 @st.cache_resource 裝飾器)
+# 安全初始化 DataLoader（絕不使用 @st.cache_resource，防止回傳 None 時引發 Weak Reference 錯誤）
 def get_finmind_loader():
     if not HAS_FINMIND:
         return None
@@ -111,7 +111,7 @@ def get_watchlist():
     except Exception:
         return pd.DataFrame()
 
-# 3. 側邊欄：自選股關注清單管理
+# 3. 側邊欄：個人自選股關注清單管理
 st.sidebar.title("⭐ 個人自選股清單")
 with st.sidebar.form("add_stock_form", clear_on_submit=True):
     new_stock_id = st.text_input("輸入股票代碼 (例: 2330)", "")
