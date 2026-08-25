@@ -66,8 +66,15 @@ def init_db():
             entry_atr REAL
         )
     ''')
-    # 舊資料庫可能沒有這兩個欄位，用 ALTER TABLE 補上（欄位已存在時忽略錯誤）
-    for col_sql in ("ALTER TABLE predictions ADD COLUMN trailing_stop_price REAL",
+    # 實際上線的 predictions 表是專案最早上傳時的舊 schema（只有 12 欄），
+    # CREATE TABLE IF NOT EXISTS 對已存在的表是 no-op，所以這些欄位一直沒被補上，
+    # 導致任何一次 INSERT 只要用到這些欄位就會噴 "no such column" 並被外層 except 吞掉。
+    # 用 ALTER TABLE 逐一補齊，欄位已存在時忽略錯誤。
+    for col_sql in ("ALTER TABLE predictions ADD COLUMN revenue_yoy REAL",
+                     "ALTER TABLE predictions ADD COLUMN pe_ratio REAL",
+                     "ALTER TABLE predictions ADD COLUMN position_size REAL DEFAULT 0.0",
+                     "ALTER TABLE predictions ADD COLUMN market_regime TEXT DEFAULT 'NORMAL'",
+                     "ALTER TABLE predictions ADD COLUMN trailing_stop_price REAL",
                      "ALTER TABLE predictions ADD COLUMN entry_atr REAL"):
         try:
             cursor.execute(col_sql)

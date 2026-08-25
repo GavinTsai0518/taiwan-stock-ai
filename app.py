@@ -81,6 +81,18 @@ def init_all_tables():
                 stock_id TEXT PRIMARY KEY, stock_name TEXT, added_date TEXT
             )
         ''')
+        # 上線中的 predictions 表是最早上傳時的舊 12 欄 schema，CREATE TABLE IF NOT EXISTS
+        # 對既有表是 no-op 不會補欄位，這裡用 ALTER TABLE 補齊（欄位已存在時忽略錯誤）
+        for col_sql in ("ALTER TABLE predictions ADD COLUMN revenue_yoy REAL",
+                         "ALTER TABLE predictions ADD COLUMN pe_ratio REAL",
+                         "ALTER TABLE predictions ADD COLUMN position_size REAL DEFAULT 0.0",
+                         "ALTER TABLE predictions ADD COLUMN market_regime TEXT DEFAULT 'NORMAL'",
+                         "ALTER TABLE predictions ADD COLUMN trailing_stop_price REAL",
+                         "ALTER TABLE predictions ADD COLUMN entry_atr REAL"):
+            try:
+                cursor.execute(col_sql)
+            except sqlite3.OperationalError:
+                pass
         conn.commit()
         conn.close()
     except Exception as e:
