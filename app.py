@@ -2,6 +2,7 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 import numpy as np
+import os
 from datetime import datetime, timedelta
 
 # 1. 頁面基礎設定
@@ -24,21 +25,42 @@ except Exception:
     pass
 
 DB_NAME = "paper_trading.db"
-FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoiMDUxOGNoaXl1QGdtYWlsLmNvbSIsImVtYWlsIjoiMDUxOGNoaXl1QGdtYWlsLmNvbSIsInRva2VuX3ZlcnNpb24iOjAsImV4cCI6MTc4ODI0MDUwOH0.dNGO-ZUPpWW30mfiUdwMqIJV-v2bqShtiLJsoy4vh7I"
 
-def get_finmind_loader():
+# --- 修正 1：Token 不再寫死在程式碼中 ---
+# 優先順序：st.secrets > 環境變數 > 側邊欄手動輸入
+def get_token():
+    try:
+        if "FINMIND_TOKEN" in st.secrets:
+            return st.secrets["FINMIND_TOKEN"]
+    except Exception:
+        pass
+    env_token = os.environ.get("FINMIND_TOKEN")
+    if env_token:
+        return env_token
+    return st.sidebar.text_input("FinMind API Token（未設定 secrets 時手動輸入）", type="password")
+
+FINMIND_TOKEN = get_token()
+
+# --- 修正 2：登入結果不再靜默吞掉，明確顯示連線狀態 ---
+def get_finmind_loader(token):
     if not HAS_FINMIND:
+        st.sidebar.warning("⚠️ 尚未安裝 FinMind 套件（pip install FinMind），個股資料功能將無法使用。")
+        return None
+    if not token:
+        st.sidebar.info("ℹ️ 尚未提供 FinMind Token，個股資料功能將無法使用。")
         return None
     try:
         loader = DataLoader()
-        loader.login_by_token(token=FINMIND_TOKEN)
+        loader.login_by_token(token=token)
+        st.sidebar.success("✅ FinMind 資料源連線成功")
         return loader
-    except Exception:
+    except Exception as e:
+        st.sidebar.error(f"❌ FinMind 登入失敗：{e}")
         return None
 
-dl = get_finmind_loader()
+dl = get_finmind_loader(FINMIND_TOKEN)
 
-# 2. 安全資料庫初始化
+# 2. 資料庫初始化（保留原本結構，但錯誤會顯示出來）
 def init_all_tables():
     try:
         conn = sqlite3.connect(DB_NAME)
@@ -61,17 +83,47 @@ def init_all_tables():
         ''')
         conn.commit()
         conn.close()
-    except Exception:
-        pass
+    except Exception as e:
+        st.error(f"資料庫初始化失敗：{e}")
 
 init_all_tables()
+
+# --- 修正 3：predictions 表格原本永遠沒有資料來源，這裡補一個「示範資料」產生器 ---
+# 這不是真正的 AI 選股邏輯，只是讓介面有東西可以顯示。
+# 你要接自己的模型時，把真正的推薦結果 INSERT 進 predictions 表即可，
+# 欄位格式跟這個函式一致。
+def seed_demo_predictions_if_empty():
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        cursor.execute("SELECT COUNT(*) FROM predictions WHERE predict_date = ?", (today_str,))
+        count_today = cursor.fetchone()[0]
+        if count_today == 0:
+            demo_rows = [
+                (today_str, "2330", "台積電", 1050.0, 1045.0, 1120.0, 1010.0, 68.5, "PENDING", 0, 0, None, 12.3, 22.1, 8.0, "NORMAL"),
+                (today_str, "2317", "鴻海", 205.0, 203.0, 220.0, 195.0, 61.2, "PENDING", 0, 0, None, 5.6, 11.4, 5.0, "NORMAL"),
+            ]
+            cursor.executemany('''
+                INSERT INTO predictions
+                (predict_date, stock_id, stock_name, latest_price, buy_price, tp_price, sl_price,
+                 ai_win_rate, status, real_max_price, real_min_price, validated_date,
+                 revenue_yoy, pe_ratio, position_size, market_regime)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', demo_rows)
+            conn.commit()
+        conn.close()
+    except Exception as e:
+        st.warning(f"示範資料建立失敗（不影響其他功能）：{e}")
+
+seed_demo_predictions_if_empty()
 
 # 3. 自選股安全操作函數
 def add_to_watchlist(stock_id):
     stock_id = str(stock_id).strip()
     if not stock_id:
         return False, "請輸入有效的股票代碼！"
-    
+
     stock_name = f"股票 {stock_id}"
     if dl:
         try:
@@ -93,7 +145,7 @@ def add_to_watchlist(stock_id):
         conn.close()
         return True, f"成功加入自選股：{stock_name} ({stock_id})"
     except Exception:
-        return False, "加入失敗 (該標的可能已在自選股清單中)"
+        return False, "加入失敗（該標的可能已在自選股清單中）"
 
 def remove_from_watchlist(stock_id):
     try:
@@ -102,8 +154,8 @@ def remove_from_watchlist(stock_id):
         cursor.execute("DELETE FROM watchlist WHERE stock_id=?", (stock_id,))
         conn.commit()
         conn.close()
-    except Exception:
-        pass
+    except Exception as e:
+        st.error(f"刪除失敗：{e}")
 
 def get_watchlist():
     try:
@@ -153,7 +205,8 @@ def load_predictions():
         df = pd.read_sql("SELECT * FROM predictions", conn)
         conn.close()
         return df
-    except Exception:
+    except Exception as e:
+        st.error(f"讀取歷史預測失敗：{e}")
         return pd.DataFrame()
 
 df_all = load_predictions()
@@ -179,7 +232,7 @@ with col3:
 
 st.divider()
 
-# 6. 安全頁籤渲染
+# 6. 頁籤渲染
 tab1, tab2, tab3 = st.tabs(["🔥 今日 AI 精選決策", "🔍 個股 K 線 / 籌碼 / 財報深度圖解", "📜 歷史預測對照表"])
 
 today_str = datetime.now().strftime('%Y-%m-%d')
@@ -190,6 +243,7 @@ if not df_all.empty and 'predict_date' in df_all.columns:
 # Tab 1: 今日 AI 精選
 with tab1:
     st.subheader(f"🤖 今日 ({today_str}) AI 精選標的與建議")
+    st.caption("⚠️ 目前顯示為示範資料，尚未接上真正的 AI 選股引擎（見程式中 seed_demo_predictions_if_empty）。")
     if not df_today.empty:
         for _, row in df_today.iterrows():
             l_price = float(row.get('latest_price', 0))
@@ -206,21 +260,27 @@ with tab1:
             <div style="background:#ffffff; border-left:5px solid #2563eb; border:1px solid #e2e8f0; border-radius:8px; padding:16px; margin-bottom:15px;">
                 <h3 style="margin:0; color:#1e3a8a;">📌 {row.get('stock_name', '未知')} ({row.get('stock_id', '')})</h3>
                 <p style="margin-top:5px; color:#475569;">
-                    <b>最新收盤價：</b> NT$ {l_price} ｜ 
+                    <b>最新收盤價：</b> NT$ {l_price} ｜
                     <b>AI 勝率：</b> <span style="color:#d97706; font-size:18px; font-weight:bold;">{row.get('ai_win_rate', 0)}%</span> ｜
                     <b>建議部位：</b> <span style="color:#2563eb; font-size:18px; font-weight:bold;">{pos_size}% 總資金</span> ｜
                     <b>營收 YoY：</b> <span style="color:#16a34a; font-weight:bold;">{rev_str}</span>
                 </p>
             </div>
             """, unsafe_allow_html=True)
-            with st.expander(f"📖 點擊查看風控細節與買賣點算價"):
-                st.write(f"- **建議買入價**：`NT$ {row.get('buy_price', l_price)}` | **停利價**：`NT$ {tp_p}` | **停損價**：`NT$ {sl_p}`")
+            with st.expander("📖 點擊查看風控細節與買賣點算價"):
+                st.write(f"- **建議買入價**：`NT$ {row.get('buy_price', l_price)}` | **停利價**：`NT$ {tp_p}` | **停損價**：`NT$ {sl_p}` | **風報比**：`{rr_ratio}`")
     else:
         st.info("今日市場經 AI 與風控過濾後無符合進場條件之標的，建議觀望保持現金。")
 
 # Tab 2: K線與圖表
 with tab2:
     st.subheader("📊 互動式技術面、籌碼面與基本面圖解")
+
+    if not HAS_PLOTLY:
+        st.warning("⚠️ 尚未安裝 plotly（pip install plotly），將以簡易折線圖代替 K 線圖。")
+    if not dl:
+        st.warning("⚠️ FinMind 未連線成功，此分頁功能暫時無法使用（請檢查側邊欄的連線狀態訊息）。")
+
     stock_options = {}
     if not df_today.empty:
         for _, r in df_today.iterrows():
@@ -238,12 +298,12 @@ with tab2:
     if selected_stock_id and dl:
         start_date = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d')
         df_stock, df_chip, df_rev, df_per = pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-        
+
         with st.spinner(f"載入 {selected_stock_id} 數據中..."):
             try:
                 df_stock = dl.taiwan_stock_daily(stock_id=selected_stock_id, start_date=start_date)
-            except Exception:
-                pass
+            except Exception as e:
+                st.error(f"抓取股價失敗：{e}")
             try:
                 df_chip = dl.taiwan_stock_institutional_investors(stock_id=selected_stock_id, start_date=start_date)
             except Exception:
@@ -310,7 +370,9 @@ with tab2:
                     else:
                         st.write("無月營收數據。")
             except Exception as e:
-                st.warning(f"圖表繪製遭遇輕微異常，已降級顯示數據: {e}")
+                st.warning(f"圖表繪製遭遇異常，已降級顯示數據: {e}")
+        else:
+            st.info(f"目前抓不到 {selected_stock_id} 的股價資料（可能是代碼錯誤、FinMind 額度用盡，或該股近期無交易資料）。")
 
 # Tab 3
 with tab3:
