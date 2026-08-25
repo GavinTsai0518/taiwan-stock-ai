@@ -7,19 +7,21 @@ from datetime import datetime, timedelta
 # 1. 頁面基礎設定
 st.set_page_config(page_title="台股 AI 量化智庫與互動終端", page_icon="📈", layout="wide")
 
-# 動態套件載入防護
+# 第三方套件載入防護
+HAS_PLOTLY = False
 try:
     import plotly.graph_objects as pgo
     from plotly.subplots import make_subplots
     HAS_PLOTLY = True
 except Exception:
-    HAS_PLOTLY = False
+    pass
 
+HAS_FINMIND = False
 try:
     from FinMind.data import DataLoader
     HAS_FINMIND = True
 except Exception:
-    HAS_FINMIND = False
+    pass
 
 DB_NAME = "paper_trading.db"
 FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoiMDUxOGNoaXl1QGdtYWlsLmNvbSIsImVtYWlsIjoiMDUxOGNoaXl1QGdtYWlsLmNvbSIsInRva2VuX3ZlcnNpb24iOjAsImV4cCI6MTc4ODI0MDUwOH0.dNGO-ZUPpWW30mfiUdwMqIJV-v2bqShtiLJsoy4vh7I"
@@ -59,7 +61,7 @@ def init_all_tables():
         ''')
         conn.commit()
         conn.close()
-    except Exception as e:
+    except Exception:
         pass
 
 init_all_tables()
@@ -77,7 +79,7 @@ def add_to_watchlist(stock_id):
             if not info.empty and 'stock_id' in info.columns:
                 matched = info[info['stock_id'] == stock_id]
                 if not matched.empty:
-                    stock_name = matched['stock_name'].iloc[0]
+                    stock_name = str(matched['stock_name'].iloc[0])
         except Exception:
             pass
 
@@ -177,7 +179,7 @@ with col3:
 
 st.divider()
 
-# 6. 安全頁籤渲染 (Tabs)
+# 6. 安全頁籤渲染
 tab1, tab2, tab3 = st.tabs(["🔥 今日 AI 精選決策", "🔍 個股 K 線 / 籌碼 / 財報深度圖解", "📜 歷史預測對照表"])
 
 today_str = datetime.now().strftime('%Y-%m-%d')
@@ -185,7 +187,7 @@ df_today = pd.DataFrame()
 if not df_all.empty and 'predict_date' in df_all.columns:
     df_today = df_all[df_all['predict_date'] == today_str]
 
-# Tab 1
+# Tab 1: 今日 AI 精選
 with tab1:
     st.subheader(f"🤖 今日 ({today_str}) AI 精選標的與建議")
     if not df_today.empty:
@@ -216,7 +218,7 @@ with tab1:
     else:
         st.info("今日市場經 AI 與風控過濾後無符合進場條件之標的，建議觀望保持現金。")
 
-# Tab 2
+# Tab 2: K線與圖表
 with tab2:
     st.subheader("📊 互動式技術面、籌碼面與基本面圖解")
     stock_options = {}
@@ -235,61 +237,80 @@ with tab2:
 
     if selected_stock_id and dl:
         start_date = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d')
+        df_stock, df_chip, df_rev, df_per = pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        
         with st.spinner(f"載入 {selected_stock_id} 數據中..."):
             try:
                 df_stock = dl.taiwan_stock_daily(stock_id=selected_stock_id, start_date=start_date)
+            except Exception:
+                pass
+            try:
                 df_chip = dl.taiwan_stock_institutional_investors(stock_id=selected_stock_id, start_date=start_date)
+            except Exception:
+                pass
+            try:
                 df_rev = dl.taiwan_stock_month_revenue(stock_id=selected_stock_id, start_date=(datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d'))
+            except Exception:
+                pass
+            try:
                 df_per = dl.taiwan_stock_per_pbr(stock_id=selected_stock_id, start_date=start_date)
+            except Exception:
+                pass
+
+        if not df_stock.empty and 'close' in df_stock.columns and len(df_stock) > 5:
+            try:
+                df_stock = df_stock.rename(columns={'max': 'High', 'min': 'Low', 'close': 'Close', 'open': 'Open', 'Trading_Volume': 'Volume'})
+                df_stock['date'] = pd.to_datetime(df_stock['date'])
+                df_stock = df_stock.sort_values('date').reset_index(drop=True)
+
+                df_stock['MA5'] = df_stock['Close'].rolling(5).mean()
+                df_stock['MA20'] = df_stock['Close'].rolling(20).mean()
+
+                foreign_net = pd.Series(0, index=df_stock.index)
+                trust_net = pd.Series(0, index=df_stock.index)
+                if not df_chip.empty and 'name' in df_chip.columns:
+                    df_chip['date'] = pd.to_datetime(df_chip['date'])
+                    f_buy = df_chip[df_chip['name'] == 'Foreign_Investor'].groupby('date')['buy'].sum() - df_chip[df_chip['name'] == 'Foreign_Investor'].groupby('date')['sell'].sum()
+                    t_buy = df_chip[df_chip['name'] == 'Investment_Trust'].groupby('date')['buy'].sum() - df_chip[df_chip['name'] == 'Investment_Trust'].groupby('date')['sell'].sum()
+                    foreign_net = df_stock['date'].map(f_buy).fillna(0) / 1000.0
+                    trust_net = df_stock['date'].map(t_buy).fillna(0) / 1000.0
+
+                if HAS_PLOTLY:
+                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.65, 0.35],
+                                        subplot_titles=(f"{selected_stock_id} K 線圖 (MA5 / MA20)", "三大法人買賣超 (張)"))
+
+                    fig.add_trace(pgo.Candlestick(
+                        x=df_stock['date'], open=df_stock['Open'], high=df_stock['High'], low=df_stock['Low'], close=df_stock['Close'],
+                        name="日 K 線", increasing_line_color='#ef4444', decreasing_line_color='#22c55e'
+                    ), row=1, col=1)
+
+                    fig.add_trace(pgo.Scatter(x=df_stock['date'], y=df_stock['MA5'], mode='lines', name='MA5', line=dict(color='#f59e0b', width=1.5)), row=1, col=1)
+                    fig.add_trace(pgo.Scatter(x=df_stock['date'], y=df_stock['MA20'], mode='lines', name='MA20', line=dict(color='#3b82f6', width=1.5)), row=1, col=1)
+
+                    fig.add_trace(pgo.Bar(x=df_stock['date'], y=foreign_net, name='外資(張)', marker_color='#8b5cf6'), row=2, col=1)
+                    fig.add_trace(pgo.Bar(x=df_stock['date'], y=trust_net, name='投信(張)', marker_color='#ec4899'), row=2, col=1)
+
+                    fig.update_layout(height=600, xaxis_rangeslider_visible=False, template="plotly_white", margin=dict(l=20, r=20, t=40, b=20))
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.line_chart(df_stock.set_index('date')[['Close', 'MA5', 'MA20']])
+
+                col_f1, col_f2 = st.columns(2)
+                with col_f1:
+                    st.write("**💰 估值指標 (PE / PB)**")
+                    if not df_per.empty and 'PER' in df_per.columns:
+                        st.info(f"- 本益比 (PE): `{df_per['PER'].iloc[-1]} 倍`\n- 股價淨值比 (PB): `{df_per['PBR'].iloc[-1]} 倍`")
+                    else:
+                        st.write("無估值數據。")
+                with col_f2:
+                    st.write("**📊 近期月營收**")
+                    if not df_rev.empty and 'revenue' in df_rev.columns:
+                        cols_to_show = [c for c in ['revenue_year', 'revenue_month', 'revenue'] if c in df_rev.columns]
+                        st.dataframe(df_rev.tail(5)[cols_to_show], hide_index=True)
+                    else:
+                        st.write("無月營收數據。")
             except Exception as e:
-                st.error(f"數據抓取提示: {e}")
-                df_stock = pd.DataFrame()
-
-        if not df_stock.empty and 'close' in df_stock.columns:
-            df_stock = df_stock.rename(columns={'max': 'High', 'min': 'Low', 'close': 'Close', 'open': 'Open', 'Trading_Volume': 'Volume'})
-            df_stock['date'] = pd.to_datetime(df_stock['date'])
-            df_stock = df_stock.sort_values('date').reset_index(drop=True)
-
-            df_stock['MA5'] = df_stock['Close'].rolling(5).mean()
-            df_stock['MA20'] = df_stock['Close'].rolling(20).mean()
-
-            foreign_net = pd.Series(0, index=df_stock.index)
-            trust_net = pd.Series(0, index=df_stock.index)
-            if not df_chip.empty and 'name' in df_chip.columns:
-                df_chip['date'] = pd.to_datetime(df_chip['date'])
-                f_buy = df_chip[df_chip['name'] == 'Foreign_Investor'].groupby('date')['buy'].sum() - df_chip[df_chip['name'] == 'Foreign_Investor'].groupby('date')['sell'].sum()
-                t_buy = df_chip[df_chip['name'] == 'Investment_Trust'].groupby('date')['buy'].sum() - df_chip[df_chip['name'] == 'Investment_Trust'].groupby('date')['sell'].sum()
-                foreign_net = df_stock['date'].map(f_buy).fillna(0) / 1000.0
-                trust_net = df_stock['date'].map(t_buy).fillna(0) / 1000.0
-
-            if HAS_PLOTLY:
-                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.65, 0.35],
-                                    subplot_titles=(f"{selected_stock_id} K 線圖 (MA5 / MA20)", "三大法人買賣超 (張)"))
-
-                fig.add_trace(pgo.Candlestick(
-                    x=df_stock['date'], open=df_stock['Open'], high=df_stock['High'], low=df_stock['Low'], close=df_stock['Close'],
-                    name="日 K 線", increasing_line_color='#ef4444', decreasing_line_color='#22c55e'
-                ), row=1, col=1)
-
-                fig.add_trace(pgo.Scatter(x=df_stock['date'], y=df_stock['MA5'], mode='lines', name='MA5', line=dict(color='#f59e0b', width=1.5)), row=1, col=1)
-                fig.add_trace(pgo.Scatter(x=df_stock['date'], y=df_stock['MA20'], mode='lines', name='MA20', line=dict(color='#3b82f6', width=1.5)), row=1, col=1)
-
-                fig.add_trace(pgo.Bar(x=df_stock['date'], y=foreign_net, name='外資(張)', marker_color='#8b5cf6'), row=2, col=1)
-                fig.add_trace(pgo.Bar(x=df_stock['date'], y=trust_net, name='投信(張)', marker_color='#ec4899'), row=2, col=1)
-
-                fig.update_layout(height=600, xaxis_rangeslider_visible=False, template="plotly_white", margin=dict(l=20, r=20, t=40, b=20))
-                st.plotly_chart(fig, use_container_width=True)
-
-            col_f1, col_f2 = st.columns(2)
-            with col_f1:
-                st.write("**💰 估值指標 (PE / PB)**")
-                if not df_per.empty and 'PER' in df_per.columns:
-                    st.info(f"- 本益比 (PE): `{df_per['PER'].iloc[-1]} 倍`\n- 股價淨值比 (PB): `{df_per['PBR'].iloc[-1]} 倍`")
-            with col_f2:
-                st.write("**📊 近期月營收**")
-                if not df_rev.empty and 'revenue' in df_rev.columns:
-                    cols_to_show = [c for c in ['revenue_year', 'revenue_month', 'revenue'] if c in df_rev.columns]
-                    st.dataframe(df_rev.tail(5)[cols_to_show], hide_index=True)
+                st.warning(f"圖表繪製遭遇輕微異常，已降級顯示數據: {e}")
 
 # Tab 3
 with tab3:
