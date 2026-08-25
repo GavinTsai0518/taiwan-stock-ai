@@ -1,0 +1,7 @@
+pandas
+numpy
+FinMind
+scikit-learn
+xgboost
+lightgbm
+streamlit
