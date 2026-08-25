@@ -1,0 +1,35 @@
+name: Daily Stock AI Run
+
+on:
+  schedule:
+    # 每天 UTC 時間 07:15 執行 (相當於台灣時間 15:15)
+    - cron: '15 7 * * 1-5'
+  workflow_dispatch: # 支援手動觸發
+
+jobs:
+  run-ai:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run AI Quant Pipeline
+        run: python paper_trading.py
+
+      - name: Commit and Push updated DB
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add paper_trading.db
+          git commit -m "Auto-update database with daily AI predictions" || exit 0
+          git push
