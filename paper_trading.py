@@ -73,6 +73,29 @@ def init_db():
             cursor.execute(col_sql)
         except sqlite3.OperationalError:
             pass
+
+    # 每日觀察報告：不論是否達進場門檻，都記錄總分前十名 + 成交量異常放大名單，每支股票附個別報告文字
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS daily_watchlist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_date TEXT,
+            stock_id TEXT,
+            stock_name TEXT,
+            category TEXT,
+            rank INTEGER,
+            latest_price REAL,
+            total_score REAL,
+            tech_score REAL,
+            fund_score REAL,
+            chip_score REAL,
+            volume REAL,
+            volume_avg20 REAL,
+            volume_surge_pct REAL,
+            revenue_yoy REAL,
+            pe_ratio REAL,
+            report_text TEXT
+        )
+    ''')
     conn.commit()
     conn.close()
 
@@ -261,26 +284,30 @@ def get_market_active_stocks():
     return default_pool
 
 # ==========================================
-# 三大因子群評分（規格書第 2 節）
+# 三大因子群評分（規格書第 2 節）：每個函式回傳 (分數, 細節 dict)，
+# 細節 dict 供個股報告文字使用，不只是給模型內部用的中間值。
 # ==========================================
 def score_technical(df):
     if len(df) < 60:
-        return None
+        return None, None
     close = df['Close']
     ma5 = close.rolling(5).mean()
     ma20 = close.rolling(20).mean()
     ma60 = close.rolling(60).mean()
     if pd.isna(ma60.iloc[-1]):
-        return None
+        return None, None
 
     c, m5, m20, m60 = close.iloc[-1], ma5.iloc[-1], ma20.iloc[-1], ma60.iloc[-1]
 
     if m5 > m20 > m60:
         s_trend = 100.0
+        trend_label = "多頭排列 (MA5>MA20>MA60)"
     elif m5 > m20:
         s_trend = 60.0
+        trend_label = "MA5>MA20，但未站上季線"
     else:
         s_trend = 0.0
+        trend_label = "空頭排列 (MA5<MA20)"
 
     bias = (c - m20) / m20 * 100
     if bias <= 0:
@@ -291,9 +318,10 @@ def score_technical(df):
         s_bias = max(0.0, 100 - (bias - 5) * 10)
 
     vol = df['Volume']
-    vol_ma20 = vol.rolling(20).mean().iloc[-1]
-    vol_ratio = vol.iloc[-1] / (vol_ma20 + 1e-6)
-    is_red = close.iloc[-1] > df['Open'].iloc[-1]
+    vol_today = float(vol.iloc[-1])
+    vol_ma20 = float(vol.rolling(20).mean().iloc[-1])
+    vol_ratio = vol_today / (vol_ma20 + 1e-6)
+    is_red = bool(close.iloc[-1] > df['Open'].iloc[-1])
     if vol_ratio >= 1.2 and is_red:
         s_vol = 100.0
     elif is_red:
@@ -308,7 +336,18 @@ def score_technical(df):
     else:
         s_mom = 50.0
 
-    return round((s_trend + s_bias + s_vol + s_mom) / 4, 1)
+    score = round((s_trend + s_bias + s_vol + s_mom) / 4, 1)
+    details = {
+        'trend_label': trend_label,
+        'bias_pct': round(bias, 1),
+        'vol_ratio': round(vol_ratio, 2),
+        'is_red': is_red,
+        'momentum_pct': round(s_mom, 1),
+        'volume_today': vol_today,
+        'volume_avg20': vol_ma20,
+        'volume_surge_pct': round((vol_ratio - 1) * 100, 1),
+    }
+    return score, details
 
 def score_fundamental(yoy, mom_turned_positive, per_series):
     if yoy is None or pd.isna(yoy):
@@ -327,6 +366,7 @@ def score_fundamental(yoy, mom_turned_positive, per_series):
     per_clean = per_series.dropna()
     per_window = per_clean.tail(756)  # 約 3 年交易日
     current_per = per_clean.iloc[-1] if not per_clean.empty else None
+    percentile = None
     if current_per is not None and len(per_window) >= 60:
         percentile = float((per_window <= current_per).mean() * 100)
         if percentile <= 20:
@@ -338,10 +378,17 @@ def score_fundamental(yoy, mom_turned_positive, per_series):
     else:
         s_val = 50.0
 
-    return round(s_yoy * 0.55 + s_val * 0.45, 1)
+    score = round(s_yoy * 0.55 + s_val * 0.45, 1)
+    details = {
+        'yoy': yoy,
+        'mom_turned_positive': bool(mom_turned_positive),
+        'per_current': float(current_per) if current_per is not None else None,
+        'per_percentile': percentile,
+    }
+    return score, details
 
 def score_chip(foreign_net, trust_net, volume):
-    def streak_score(net_series):
+    def streak_count(net_series):
         recent = net_series.tail(10)
         streak = 0
         for v in recent.iloc[::-1]:
@@ -349,17 +396,48 @@ def score_chip(foreign_net, trust_net, volume):
                 streak += 1
             else:
                 break
-        return min(100.0, streak / 5 * 100)
+        return streak
 
-    s_foreign = streak_score(foreign_net)
-    s_trust = streak_score(trust_net)
+    f_streak = streak_count(foreign_net)
+    t_streak = streak_count(trust_net)
+    s_foreign = min(100.0, f_streak / 5 * 100)
+    s_trust = min(100.0, t_streak / 5 * 100)
 
     combined_5d = foreign_net.tail(5).sum() + trust_net.tail(5).sum()
     volume_5d = volume.tail(5).sum()
     ratio = combined_5d / (volume_5d + 1e-6)  # 用股數比例代替金額比例（FinMind 籌碼資料為股數，非金額）
     s_strength = max(0.0, min(100.0, ratio / 0.1 * 100))
 
-    return round(s_foreign * 0.3 + s_trust * 0.4 + s_strength * 0.3, 1)
+    score = round(s_foreign * 0.3 + s_trust * 0.4 + s_strength * 0.3, 1)
+    details = {
+        'foreign_streak': f_streak,
+        'trust_streak': t_streak,
+        'strength_ratio_pct': round(ratio * 100, 2),
+    }
+    return score, details
+
+def build_stock_report(name, stock_id, latest_price, tech_score, tech_d,
+                        fund_score, fund_d, chip_score, chip_d,
+                        total_score, passed, score_threshold):
+    yoy_txt = f"{fund_d['yoy']:.1f}%" if fund_d['yoy'] is not None else "無資料"
+    per_txt = f"{fund_d['per_current']:.1f} 倍" if fund_d['per_current'] is not None else "無資料"
+    per_pct_txt = f"（近3年百分位 {fund_d['per_percentile']:.0f}%，越低越便宜）" if fund_d['per_percentile'] is not None else ""
+    mom_txt = "，月營收由負轉正" if fund_d['mom_turned_positive'] else ""
+
+    lines = [
+        f"【{name}({stock_id})】最新收盤 NT$ {latest_price}",
+        f"總分 {total_score} 分（進場門檻 {score_threshold} 分）— {'✅ 達進場標準' if passed else '⚪ 尚未達標，列入觀察'}",
+        f"技術面 {tech_score} 分：{tech_d['trend_label']}，乖離率 {tech_d['bias_pct']}%，"
+        f"量比 {tech_d['vol_ratio']} 倍（{'收紅' if tech_d['is_red'] else '收黑'}），"
+        f"近一年 5 日報酬動能百分位 {tech_d['momentum_pct']}%",
+        f"基本面 {fund_score} 分：營收 YoY {yoy_txt}{mom_txt}，PE {per_txt}{per_pct_txt}",
+        f"籌碼面 {chip_score} 分：外資連續買超 {chip_d['foreign_streak']} 天，"
+        f"投信連續買超 {chip_d['trust_streak']} 天，"
+        f"近5日法人買超力道占成交量比例 {chip_d['strength_ratio_pct']}%",
+        f"成交量：今日 {tech_d['volume_today']:,.0f} 股，20日均量 {tech_d['volume_avg20']:,.0f} 股，"
+        f"較均量{'放大' if tech_d['volume_surge_pct'] >= 0 else '萎縮'} {abs(tech_d['volume_surge_pct']):.1f}%",
+    ]
+    return "\n".join(lines)
 
 def calculate_position_size(buy_price, sl_price, risk_pct):
     sl_pct = (buy_price - sl_price) / buy_price
@@ -390,6 +468,7 @@ def main():
     init_db()
     conn = sqlite3.connect(DB_NAME)
     results = []
+    all_candidates = []
 
     for stock_id, name in dynamic_stock_pool.items():
         try:
@@ -454,11 +533,11 @@ def main():
             if latest_per is not None and (latest_per > 80.0 or latest_per < 0):
                 continue
 
-            tech_score = score_technical(df)
+            tech_score, tech_detail = score_technical(df)
             if tech_score is None:
                 continue
-            fund_score = score_fundamental(latest_yoy, mom_turned_positive, per_series)
-            chip_score = score_chip(df['Foreign_Buy'], df['Trust_Buy'], df['Volume'])
+            fund_score, fund_detail = score_fundamental(latest_yoy, mom_turned_positive, per_series)
+            chip_score, chip_detail = score_chip(df['Foreign_Buy'], df['Trust_Buy'], df['Volume'])
 
             total_score = round(tech_score * WEIGHT_TECH + fund_score * WEIGHT_FUND + chip_score * WEIGHT_CHIP, 1)
             passed = total_score >= score_threshold and min(tech_score, fund_score, chip_score) >= MIN_FACTOR_SCORE
@@ -500,8 +579,49 @@ def main():
                 '建議買入價': buy_price, '停利價': tp_price, '停損價': sl_price,
                 '建議部位(%)': pos_size
             })
+
+            report_text = build_stock_report(
+                name, stock_id, latest_price, tech_score, tech_detail,
+                fund_score, fund_detail, chip_score, chip_detail,
+                total_score, passed, score_threshold
+            )
+            all_candidates.append({
+                'stock_id': stock_id, 'name': name, 'latest_price': latest_price,
+                'total_score': total_score, 'tech_score': tech_score,
+                'fund_score': fund_score, 'chip_score': chip_score,
+                'volume_today': tech_detail['volume_today'],
+                'volume_avg20': tech_detail['volume_avg20'],
+                'volume_surge_pct': tech_detail['volume_surge_pct'],
+                'yoy': latest_yoy, 'per': latest_per,
+                'report_text': report_text,
+            })
         except Exception:
             continue
+
+    # ===== 每日觀察報告：不論是否達進場門檻，總分前十名 + 成交量異常放大前十名，各附個別報告 =====
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM daily_watchlist WHERE report_date=?", (today_str,))
+
+    def insert_watchlist(candidates, category):
+        for rank, c in enumerate(candidates, start=1):
+            cursor.execute('''
+                INSERT INTO daily_watchlist
+                (report_date, stock_id, stock_name, category, rank, latest_price,
+                 total_score, tech_score, fund_score, chip_score,
+                 volume, volume_avg20, volume_surge_pct, revenue_yoy, pe_ratio, report_text)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (today_str, c['stock_id'], c['name'], category, rank, c['latest_price'],
+                  c['total_score'], c['tech_score'], c['fund_score'], c['chip_score'],
+                  c['volume_today'], c['volume_avg20'], c['volume_surge_pct'],
+                  round(c['yoy'], 1) if c['yoy'] is not None else None,
+                  round(c['per'], 1) if c['per'] is not None else None,
+                  c['report_text']))
+
+    top_by_score = sorted(all_candidates, key=lambda c: c['total_score'], reverse=True)[:10]
+    insert_watchlist(top_by_score, 'TOP_SCORE')
+
+    top_by_volume = sorted(all_candidates, key=lambda c: c['volume_surge_pct'], reverse=True)[:10]
+    insert_watchlist(top_by_volume, 'VOLUME_SURGE')
 
     conn.commit()
     conn.close()
@@ -510,7 +630,7 @@ def main():
         final_df = pd.DataFrame(results).sort_values(by='總分', ascending=False).reset_index(drop=True)
         print("=== 多因子評分結果 ===")
         print(final_df.to_string(index=False))
-        print("\n✅ 選股與部位計算完成！結果已記錄至 paper_trading.db。")
+        print(f"\n✅ 選股與部位計算完成！今日觀察名單（前十名 + 成交量異常）已記錄至 daily_watchlist。")
     else:
         print("今日無符合條件標的。")
 

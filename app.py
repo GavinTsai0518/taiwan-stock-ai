@@ -233,7 +233,8 @@ with col3:
 st.divider()
 
 # 6. 頁籤渲染
-tab1, tab2, tab3 = st.tabs(["🔥 今日 AI 精選決策", "🔍 個股 K 線 / 籌碼 / 財報深度圖解", "📜 歷史預測對照表"])
+tab1, tab2, tab3, tab4 = st.tabs(["🔥 今日 AI 精選決策", "🔍 個股 K 線 / 籌碼 / 財報深度圖解",
+                                   "📜 歷史預測對照表", "📋 每日觀察報告"])
 
 today_str = datetime.now().strftime('%Y-%m-%d')
 df_today = pd.DataFrame()
@@ -383,3 +384,46 @@ with tab3:
         st.dataframe(df_all.sort_values(by='id', ascending=False), use_container_width=True, hide_index=True)
     else:
         st.info("無歷史預測紀錄。")
+
+# Tab 4: 每日觀察報告（不論是否達進場門檻的總分前十名 + 成交量異常放大名單）
+def load_watchlist(category):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        df = pd.read_sql(
+            "SELECT * FROM daily_watchlist WHERE report_date=? AND category=? ORDER BY rank",
+            conn, params=(today_str, category)
+        )
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def render_watchlist_section(title, df_wl, score_col_label):
+    st.markdown(f"#### {title}")
+    if df_wl.empty:
+        st.info("今日尚無觀察報告（可能排程尚未執行）。")
+        return
+    for _, row in df_wl.iterrows():
+        rank = int(row.get('rank', 0))
+        name = row.get('stock_name', '')
+        sid = row.get('stock_id', '')
+        price = row.get('latest_price', 0)
+        total = row.get('total_score', 0)
+        surge = row.get('volume_surge_pct', 0)
+        col1, col2, col3 = st.columns([3, 2, 2])
+        col1.write(f"**#{rank} {name} ({sid})**")
+        col2.write(f"NT$ {price} ｜ 總分 {total}")
+        col3.write(f"量比 {'+' if surge >= 0 else ''}{surge:.1f}%")
+        with st.expander(f"📖 {name} 個別報告"):
+            st.text(row.get('report_text', '無報告內容'))
+
+with tab4:
+    st.subheader(f"📋 今日 ({today_str}) 觀察報告")
+    st.caption("不要求一定達到「建議買進」門檻，單純列出綜合評分最高的前十名，以及成交量相對均量異常放大的前十名，每支股票附個別因子拆解報告。")
+
+    df_top_score = load_watchlist('TOP_SCORE')
+    df_top_volume = load_watchlist('VOLUME_SURGE')
+
+    render_watchlist_section("🏆 綜合評分前十名觀察名單", df_top_score, "總分")
+    st.divider()
+    render_watchlist_section("📊 成交量異常放大前十名觀察名單", df_top_volume, "量比")
