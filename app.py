@@ -257,8 +257,11 @@ def load_latest_model_metrics():
         return None
 
 metrics_row = load_latest_model_metrics()
-if metrics_row is not None:
-    st.markdown("##### 🧠 自我訓練狀態")
+st.markdown("##### 🧠 自我訓練狀態")
+if metrics_row is None:
+    st.caption("尚未有自我訓練資料——會在下一次排程執行（`python paper_trading.py`）時第一次寫入，"
+               "或到 GitHub Actions 頁面手動點「Run workflow」立即觸發。")
+else:
     resolved = int(metrics_row.get('resolved_count') or 0)
     hist_wr = metrics_row.get('historical_win_rate')
     adapted = metrics_row.get('adapted_threshold')
