@@ -76,11 +76,6 @@ def init_all_tables():
                 position_size REAL DEFAULT 0.0, market_regime TEXT DEFAULT 'NORMAL'
             )
         ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS watchlist (
-                stock_id TEXT PRIMARY KEY, stock_name TEXT, added_date TEXT
-            )
-        ''')
         # 上線中的 predictions 表是最早上傳時的舊 12 欄 schema，CREATE TABLE IF NOT EXISTS
         # 對既有表是 no-op 不會補欄位，這裡用 ALTER TABLE 補齊（欄位已存在時忽略錯誤）
         for col_sql in ("ALTER TABLE predictions ADD COLUMN revenue_yoy REAL",
@@ -130,53 +125,57 @@ def seed_demo_predictions_if_empty():
 
 seed_demo_predictions_if_empty()
 
-# 3. 自選股安全操作函數
+# 3. 自選股操作函數
+# 存在瀏覽器網址列的 query params 裡，不寫本地 SQLite——paper_trading.db 每天會被排程
+# 整份覆蓋、Streamlit Cloud 重新部署或閒置喚醒也會重置容器內的檔案，寫在裡面的自選股
+# 一定會不見。query params 活在瀏覽器端，不受伺服器重啟影響：只要網址列還帶著
+# ?watch=2330,2454（重新整理、加書籤都會保留），清單就還在。
+@st.cache_data(ttl=86400)
+def _load_stock_name_map():
+    if not dl:
+        return {}
+    try:
+        info = dl.taiwan_stock_info()
+        if info.empty or 'stock_id' not in info.columns:
+            return {}
+        return dict(zip(info['stock_id'], info['stock_name']))
+    except Exception:
+        return {}
+
+def _get_watchlist_ids():
+    raw = st.query_params.get("watch", "")
+    return [s for s in raw.split(",") if s]
+
+def _set_watchlist_ids(ids):
+    if ids:
+        st.query_params["watch"] = ",".join(ids)
+    elif "watch" in st.query_params:
+        del st.query_params["watch"]
+
 def add_to_watchlist(stock_id):
     stock_id = str(stock_id).strip()
     if not stock_id:
         return False, "請輸入有效的股票代碼！"
 
-    stock_name = f"股票 {stock_id}"
-    if dl:
-        try:
-            info = dl.taiwan_stock_info()
-            if not info.empty and 'stock_id' in info.columns:
-                matched = info[info['stock_id'] == stock_id]
-                if not matched.empty:
-                    stock_name = str(matched['stock_name'].iloc[0])
-        except Exception:
-            pass
-
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        today_str = datetime.now().strftime('%Y-%m-%d')
-        cursor.execute("INSERT INTO watchlist (stock_id, stock_name, added_date) VALUES (?, ?, ?)",
-                       (stock_id, stock_name, today_str))
-        conn.commit()
-        conn.close()
-        return True, f"成功加入自選股：{stock_name} ({stock_id})"
-    except Exception:
-        return False, "加入失敗（該標的可能已在自選股清單中）"
+    ids = _get_watchlist_ids()
+    if stock_id in ids:
+        return False, "加入失敗（該標的已在自選股清單中）"
+    ids.append(stock_id)
+    _set_watchlist_ids(ids)
+    stock_name = _load_stock_name_map().get(stock_id, f"股票 {stock_id}")
+    return True, f"成功加入自選股：{stock_name} ({stock_id})"
 
 def remove_from_watchlist(stock_id):
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM watchlist WHERE stock_id=?", (stock_id,))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        st.error(f"刪除失敗：{e}")
+    ids = [i for i in _get_watchlist_ids() if i != str(stock_id)]
+    _set_watchlist_ids(ids)
 
 def get_watchlist():
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        df = pd.read_sql("SELECT * FROM watchlist", conn)
-        conn.close()
-        return df if not df.empty else pd.DataFrame(columns=['stock_id', 'stock_name', 'added_date'])
-    except Exception:
+    ids = _get_watchlist_ids()
+    if not ids:
         return pd.DataFrame(columns=['stock_id', 'stock_name', 'added_date'])
+    name_map = _load_stock_name_map()
+    rows = [{'stock_id': i, 'stock_name': name_map.get(i, f"股票 {i}"), 'added_date': ''} for i in ids]
+    return pd.DataFrame(rows)
 
 # 4. 側邊欄渲染
 st.sidebar.title("⭐ 個人自選股清單")
