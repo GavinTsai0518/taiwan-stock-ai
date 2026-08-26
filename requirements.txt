@@ -8,3 +8,4 @@ lightgbm
 streamlit>=1.38,<1.40
 plotly
 requests
+yfinance

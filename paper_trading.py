@@ -7,6 +7,7 @@ import os
 import sys
 import io
 import requests
+import yfinance as yf
 from datetime import datetime, timedelta
 from FinMind.data import DataLoader
 
@@ -15,9 +16,11 @@ warnings.filterwarnings('ignore')
 DB_NAME = "paper_trading.db"
 
 # ===== 可調參數（依「AI 選股引擎規格書」第 9 節建議預設值，之後可依實戰結果調整）=====
-WEIGHT_TECH = 0.4
-WEIGHT_FUND = 0.3
-WEIGHT_CHIP = 0.3
+# 技術/基本/籌碼/跨市場四因子權重，加總為 1.0（新增跨市場因子後，其餘三個因子權重等比例下修）
+WEIGHT_TECH = 0.35
+WEIGHT_FUND = 0.25
+WEIGHT_CHIP = 0.25
+WEIGHT_MACRO = 0.15
 ENTRY_SCORE_THRESHOLD = 70      # 一般/多頭體制進場總分門檻
 BEAR_SCORE_THRESHOLD = 80       # 空頭體制進場總分門檻（提高）
 MIN_FACTOR_SCORE = 50           # 三因子單項一票否決門檻（P0 優化：40→50，原本 40 分只是平均水準，太容易放行弱因子）
@@ -526,10 +529,53 @@ def fetch_mops_revenue_snapshot():
         result[code] = {'yoy_pct': rec['yoy_pct'], 'mom_turned_positive': mom_turned_positive}
     return result
 
+def fetch_cross_market_signal():
+    """跨市場領先指標：抓美股（S&P500 + 那斯達克平均）與日股（日經225）「最近一個已完整收盤」交易日的
+    報酬率。這支排程在台股收盤後（15:15）執行時，美股通常還沒收盤，抓到的會是「前一個」完整交易日；
+    日股當天多半已收盤，抓到的是「當天」——兩者合起來反映亞股/全球風險偏好對台股的外部影響，
+    是全市場共用的單一訊號，一次抓取即可，不需要每支股票各抓一次。
+    抓取失敗回傳 (None, None)，由 score_macro() 自行處理成中性分數，不影響其他因子。"""
+    try:
+        data = yf.download(['^GSPC', '^IXIC', '^N225'], period='10d', progress=False)['Close']
+    except Exception as e:
+        print(f"⚠️ 跨市場指數抓取失敗（{e}），跨市場因子將以中性值處理。")
+        return None, None
+
+    def _latest_return(col):
+        if col not in data.columns:
+            return None
+        s = data[col].dropna()
+        if len(s) < 2:
+            return None
+        return float((s.iloc[-1] / s.iloc[-2] - 1) * 100)
+
+    us_sp500 = _latest_return('^GSPC')
+    us_nasdaq = _latest_return('^IXIC')
+    jp_nikkei = _latest_return('^N225')
+
+    us_vals = [v for v in (us_sp500, us_nasdaq) if v is not None]
+    us_return = sum(us_vals) / len(us_vals) if us_vals else None
+
+    return us_return, jp_nikkei
+
 # ==========================================
 # 三大因子群評分（P0 優化版）：每個函式回傳 (分數, 細節 dict)，
 # 細節 dict 供個股報告文字使用，不只是給模型內部用的中間值。
 # ==========================================
+def score_macro(us_return_pct, jp_return_pct):
+    """跨市場領先指標評分：美股、日股報酬率各自換算 0~100 分（±2.5% 觸頂/觸底，中間線性），
+    美股權重較高（0.6）因為對台股電子權值股影響通常更直接，日股權重 0.4。
+    任一邊抓不到資料時該邊給中性 50 分，不會讓整個因子直接失效。"""
+    def _sub_score(pct):
+        if pct is None:
+            return 50.0
+        return max(0.0, min(100.0, 50 + pct * 20))
+
+    us_score = _sub_score(us_return_pct)
+    jp_score = _sub_score(jp_return_pct)
+    score = round(us_score * 0.6 + jp_score * 0.4, 1)
+    details = {'us_return_pct': us_return_pct, 'jp_return_pct': jp_return_pct}
+    return score, details
 def score_technical(df, volatility_regime='NORMAL'):
     """P0 優化：子維度依大盤波動率動態加權、乖離率改分段曲線、動能融合短期(60天)+長期(252天)。"""
     if len(df) < 60:
@@ -745,7 +791,7 @@ def score_chip(foreign_net, trust_net, volume, proprietary_net=None):
 
 def build_stock_report(name, stock_id, latest_price, tech_score, tech_d,
                         fund_score, fund_d, chip_score, chip_d,
-                        total_score, passed, score_threshold):
+                        macro_score, macro_d, total_score, passed, score_threshold):
     yoy_txt = f"{fund_d['yoy']:.1f}%" if fund_d['yoy'] is not None else "無資料"
     per_txt = f"{fund_d['per_current']:.1f} 倍" if fund_d['per_current'] is not None else "無資料"
     per_pct_txt = f"（近2年百分位 {fund_d['per_percentile']:.0f}%，越低越便宜）" if fund_d['per_percentile'] is not None else ""
@@ -757,6 +803,9 @@ def build_stock_report(name, stock_id, latest_price, tech_score, tech_d,
     accel_txt = "，買超力道正在加速" if chip_d.get('acceleration_bonus', 0) > 0 else ""
     prop_txt = "｜⚠️ 自營商同期賣超，與法人方向不一致" if chip_d.get('prop_vs_inst_warning') else ""
 
+    us_txt = f"{macro_d['us_return_pct']:+.2f}%" if macro_d.get('us_return_pct') is not None else "無資料"
+    jp_txt = f"{macro_d['jp_return_pct']:+.2f}%" if macro_d.get('jp_return_pct') is not None else "無資料"
+
     lines = [
         f"【{name}({stock_id})】最新收盤 NT$ {latest_price}",
         f"總分 {total_score} 分（進場門檻 {score_threshold} 分）— {'✅ 達進場標準' if passed else '⚪ 尚未達標，列入觀察'}",
@@ -767,6 +816,7 @@ def build_stock_report(name, stock_id, latest_price, tech_score, tech_d,
         f"籌碼面 {chip_score} 分：外資連續買超 {chip_d['foreign_streak']} 天，"
         f"投信連續買超 {chip_d['trust_streak']} 天，"
         f"近5日法人買超力道占成交量比例 {chip_d['strength_ratio_pct']}%{accel_txt}{prop_txt}",
+        f"跨市場 {macro_score} 分：美股(S&P500/那斯達克平均) {us_txt} ｜ 日股(日經225) {jp_txt}（全市場共用同一組數值）",
         f"成交量：今日 {tech_d['volume_today']:,.0f} 股，20日均量 {tech_d['volume_avg20']:,.0f} 股，"
         f"較均量{'放大' if tech_d['volume_surge_pct'] >= 0 else '萎縮'} {abs(tech_d['volume_surge_pct']):.1f}%",
     ]
@@ -861,6 +911,11 @@ def main():
     mops_revenue_data = fetch_mops_revenue_snapshot()
     print(f"✅ 取得 {len(mops_revenue_data)} 家公司的月營收資料。\n")
 
+    print("📡 抓取跨市場領先指標（美股 S&P500/那斯達克、日股日經225，yfinance，全市場共用單一訊號）...")
+    us_return_pct, jp_return_pct = fetch_cross_market_signal()
+    macro_score, macro_detail = score_macro(us_return_pct, jp_return_pct)
+    print(f"✅ 跨市場因子分數: {macro_score}（美股 {us_return_pct}% ｜ 日股 {jp_return_pct}%）\n")
+
     today_str = datetime.now().strftime('%Y-%m-%d')
     start_date = (datetime.now() - timedelta(days=400)).strftime('%Y-%m-%d')      # 動能百分位需要約 1 年資料
     per_start_date = (datetime.now() - timedelta(days=1150)).strftime('%Y-%m-%d')  # 估值河流位階需要約 3 年資料
@@ -921,7 +976,10 @@ def main():
             chip_score, chip_detail = score_chip(foreign_series, trust_series, df['Volume'],
                                                   proprietary_net=dealer_series)
 
-            total_score = round(tech_score * WEIGHT_TECH + fund_score * WEIGHT_FUND + chip_score * WEIGHT_CHIP, 1)
+            total_score = round(
+                tech_score * WEIGHT_TECH + fund_score * WEIGHT_FUND +
+                chip_score * WEIGHT_CHIP + macro_score * WEIGHT_MACRO, 1
+            )
 
             daily_volume_amt = float(df['Trading_money'].iloc[-1]) if 'Trading_money' in df.columns else None
             passed, entry_reason = check_entry_conditions(
@@ -962,7 +1020,7 @@ def main():
 
             results.append({
                 '股票代碼': stock_id, '股票名稱': name, '最新收盤價': latest_price,
-                '技術面': tech_score, '基本面': fund_score, '籌碼面': chip_score,
+                '技術面': tech_score, '基本面': fund_score, '籌碼面': chip_score, '跨市場': macro_score,
                 '總分': total_score, '決策建議': status_label,
                 '建議買入價': buy_price, '停利價': tp_price, '停損價': sl_price,
                 '建議部位(%)': pos_size
@@ -971,7 +1029,7 @@ def main():
             report_text = build_stock_report(
                 name, stock_id, latest_price, tech_score, tech_detail,
                 fund_score, fund_detail, chip_score, chip_detail,
-                total_score, passed, score_threshold
+                macro_score, macro_detail, total_score, passed, score_threshold
             )
             all_candidates.append({
                 'stock_id': stock_id, 'name': name, 'latest_price': latest_price,
