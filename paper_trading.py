@@ -23,6 +23,12 @@ WEIGHT_CHIP = 0.25
 WEIGHT_MACRO = 0.15
 ENTRY_SCORE_THRESHOLD = 70      # 一般/多頭體制進場總分門檻
 BEAR_SCORE_THRESHOLD = 80       # 空頭體制進場總分門檻（提高）
+
+# ===== 自我訓練功能參數（見 compute_self_training_metrics）=====
+SELF_TRAIN_MIN_SAMPLES = 20        # 累積驗證筆數（WIN+LOSS）少於此數，樣本太少不足以調整，維持固定門檻
+SELF_TRAIN_MIN_BUCKET_SAMPLES = 10  # 每個分數級距至少要有這麼多筆才拿來判斷勝率，避免小樣本雜訊誤導
+SELF_TRAIN_TARGET_WIN_RATE = 0.55   # 目標勝率：找出「總分 >= 這個門檻」的歷史勝率能達到多少的最低門檻
+SELF_TRAIN_THRESHOLD_STEPS = (0, 5, 10, 15)  # 在固定門檻基礎上往上測試的級距（只會往上調，不會往下調）
 MIN_FACTOR_SCORE = 50           # 三因子單項一票否決門檻（P0 優化：40→50，原本 40 分只是平均水準，太容易放行弱因子）
 MIN_DAILY_TURNOVER = 100_000_000  # 流動性門檻：日成交金額 < 1 億視為易滑點，直接排除
 DEFAULT_BETA = 1.0               # 個股 Beta，目前無現成資料來源，先用市場平均值 1.0（等於停用 Beta 相關加嚴條件）
@@ -35,6 +41,15 @@ CANDIDATE_POOL_SIZE = 150       # 候選股數：依 TWSE 全市場成交量排�
 TWSE_STOCK_DAY_ALL_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"  # 全市場單日快照，免費無需權杖
 TWSE_T86_URL = "https://www.twse.com.tw/rwd/zh/fund/T86"  # 三大法人買賣超日報，支援歷史日期回溯查詢
 MOPS_REVENUE_URL_TMPL = "https://mopsov.twse.com.tw/nas/t21/sii/t21sc03_{roc_year}_{month}_0.html"  # 公開資訊觀測站上市公司月營收
+TWSE_REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
+
+class TwseRateLimitError(Exception):
+    """T86 短時間內請求太多次會被 TWSE 的反爬蟲機制擋下，回傳「FOR SECURITY REASONS」的阻擋頁而不是
+    JSON 資料。這跟「當天是假日、本來就沒資料」是完全不同的情況，不該被靜默吞掉當成同一種結果——
+    否則像 ml_trend_model.py 的歷史回溯會在被擋下之後，後面幾百次請求全部拿到空結果卻毫無警示，
+    看起來只是「那些天剛好沒交易」，實際上是資料被整批打壞。呼叫端應該看到這個例外就提早停止重試。"""
+    pass
 
 # FinMind Token 一律從環境變數讀取（GitHub Actions 用 repo secret 注入），不再寫死於程式碼中。
 # DataLoader() 本身不用權杖也不連網，可以放在模組層級；真正的登入動作包成函式、只在
@@ -89,11 +104,38 @@ def init_db():
                      "ALTER TABLE predictions ADD COLUMN position_size REAL DEFAULT 0.0",
                      "ALTER TABLE predictions ADD COLUMN market_regime TEXT DEFAULT 'NORMAL'",
                      "ALTER TABLE predictions ADD COLUMN trailing_stop_price REAL",
-                     "ALTER TABLE predictions ADD COLUMN entry_atr REAL"):
+                     "ALTER TABLE predictions ADD COLUMN entry_atr REAL",
+                     # 自我訓練功能用：存下當初進場時各子維度分數，之後才能回頭分析
+                     # 「哪個子維度的分數跟實際勝負最相關」（見 compute_self_training_metrics）。
+                     "ALTER TABLE predictions ADD COLUMN tech_score REAL",
+                     "ALTER TABLE predictions ADD COLUMN fund_score REAL",
+                     "ALTER TABLE predictions ADD COLUMN chip_score REAL",
+                     "ALTER TABLE predictions ADD COLUMN macro_score REAL"):
         try:
             cursor.execute(col_sql)
         except sqlite3.OperationalError:
             pass
+
+    # 自我訓練功能：記錄每次評估時的歷史勝率、依勝率動態調整出的進場門檻、以及目前
+    # 最能區分勝負的子維度分數。見 compute_self_training_metrics()。
+    # 這張表其實已經存在於正式資料庫（早期設計就有這張表，但從沒有程式碼真的寫過/讀過），
+    # 只有舊的 5 欄，跟 predictions 表當初遇到的問題一模一樣：CREATE TABLE IF NOT EXISTS
+    # 對已存在的表是 no-op，所以一樣要用 ALTER TABLE 補欄位，否則 INSERT 會因為缺
+    # resolved_count 欄位而失敗。
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS model_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            eval_date TEXT,
+            resolved_count INTEGER,
+            historical_win_rate REAL,
+            adapted_threshold REAL,
+            top_feature TEXT
+        )
+    ''')
+    try:
+        cursor.execute("ALTER TABLE model_metrics ADD COLUMN resolved_count INTEGER")
+    except sqlite3.OperationalError:
+        pass
 
     # 每日觀察報告：不論是否達進場門檻，都記錄總分前十名 + 成交量異常放大名單，每支股票附個別報告文字
     cursor.execute('''
@@ -253,6 +295,79 @@ def audit_past_predictions():
 
     conn.commit()
     conn.close()
+
+# ==========================================
+# 自我訓練功能：用已驗證的歷史勝負，動態調整今天的進場門檻
+# ==========================================
+def compute_self_training_metrics():
+    """讀取 predictions 表裡已經驗證完（WIN/LOSS，不含 PENDING/EXPIRED）的歷史紀錄，
+    算出目前的實際勝率，並嘗試找出一個「調整後門檻」：在固定門檻基礎上，依序測試
+    +0/+5/+10/+15 分的級距，找出「總分 >= 該級距」歷史勝率能達到 SELF_TRAIN_TARGET_WIN_RATE
+    的最低級距。這個調整只會讓門檻變嚴（往上調），不會自動放寬——就算歷史勝率看起來很漂亮，
+    也不代表未來會一樣，用小樣本的漂亮數字去放寬風控門檻，過擬合/自我強化錯覺的風險比潛在
+    好處大，所以刻意設計成只能收緊，不能放寬。
+
+    同時比較 WIN 組跟 LOSS 組在 tech/fund/chip/macro 四個子分數的平均差距，抓出目前最能
+    區分勝負的子維度存成 top_feature，純粹是診斷資訊，不會拿來自動調整權重（調整權重公式
+    本身風險更高，需要更多資料和更謹慎的驗證，目前只做「調整進場門檻」這一步）。
+
+    回傳 (adapted_threshold, historical_win_rate)：
+    - 樣本數 < SELF_TRAIN_MIN_SAMPLES 時，adapted_threshold 回傳 None（代表沿用固定門檻，
+      不做任何調整，因為樣本太少時任何調整都只是雜訊，不是真訊號）。
+    - historical_win_rate 樣本不足時也回傳 None，純粹供 log 顯示用。
+    """
+    init_db()
+    conn = sqlite3.connect(DB_NAME)
+    df = pd.read_sql(
+        "SELECT * FROM predictions WHERE status LIKE 'WIN%' OR status LIKE 'LOSS%'", conn
+    )
+
+    resolved_count = len(df)
+    today_str = datetime.now().strftime('%Y-%m-%d')
+
+    if resolved_count < SELF_TRAIN_MIN_SAMPLES:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO model_metrics (eval_date, resolved_count, historical_win_rate, adapted_threshold, top_feature)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (today_str, resolved_count, None, None,
+              f"樣本不足（{resolved_count}/{SELF_TRAIN_MIN_SAMPLES}），尚未開始自我調整"))
+        conn.commit()
+        conn.close()
+        return None, None
+
+    df['is_win'] = df['status'].str.startswith('WIN')
+    historical_win_rate = float(df['is_win'].mean())
+
+    adapted_threshold = None
+    for step in SELF_TRAIN_THRESHOLD_STEPS:
+        level = ENTRY_SCORE_THRESHOLD + step
+        bucket = df[df['ai_win_rate'] >= level]
+        if len(bucket) < SELF_TRAIN_MIN_BUCKET_SAMPLES:
+            continue
+        bucket_win_rate = float(bucket['is_win'].mean())
+        if bucket_win_rate >= SELF_TRAIN_TARGET_WIN_RATE:
+            adapted_threshold = level
+            break
+
+    top_feature = None
+    sub_cols = ['tech_score', 'fund_score', 'chip_score', 'macro_score']
+    df_sub = df.dropna(subset=sub_cols)
+    if len(df_sub) >= SELF_TRAIN_MIN_BUCKET_SAMPLES:
+        win_means = df_sub[df_sub['is_win']][sub_cols].mean()
+        loss_means = df_sub[~df_sub['is_win']][sub_cols].mean()
+        gap = (win_means - loss_means).sort_values(ascending=False)
+        if not gap.empty:
+            top_feature = f"{gap.index[0]}（勝負組平均差 {gap.iloc[0]:+.1f} 分）"
+
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO model_metrics (eval_date, resolved_count, historical_win_rate, adapted_threshold, top_feature)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (today_str, resolved_count, historical_win_rate, adapted_threshold, top_feature))
+    conn.commit()
+    conn.close()
+    return adapted_threshold, historical_win_rate
 
 def detect_market_regime():
     """回傳 (趨勢體制, 波動率體制, 大盤收盤價)。
@@ -420,11 +535,15 @@ def get_market_active_stocks():
 def fetch_twse_institutional_day(date_str):
     """單日全市場三大法人買賣超（TWSE T86），date_str 格式 YYYYMMDD。
     回傳 {stock_id: {'foreign': 外資淨買超股數, 'trust': 投信淨買超股數, 'dealer': 自營商淨買超股數}}；
-    非交易日（假日）或請求失敗一律回傳空 dict，由呼叫端自行跳過。"""
+    非交易日（假日）一律回傳空 dict，由呼叫端自行跳過。若被 TWSE 反爬蟲機制擋下（短時間內請求太多次），
+    拋出 TwseRateLimitError 讓呼叫端知道要停止重試，而不是把「被擋」誤判成「這天沒資料」。"""
+    resp = requests.get(
+        TWSE_T86_URL, params={'date': date_str, 'selectType': 'ALL', 'response': 'json'},
+        headers=TWSE_REQUEST_HEADERS, timeout=20
+    )
+    if resp.status_code in (307, 403, 428) or 'SECURITY REASONS' in resp.text:
+        raise TwseRateLimitError(f"TWSE T86 請求被擋下（status={resp.status_code}），可能觸發了流量限制。")
     try:
-        resp = requests.get(
-            TWSE_T86_URL, params={'date': date_str, 'selectType': 'ALL', 'response': 'json'}, timeout=20
-        )
         resp.raise_for_status()
         data = resp.json()
     except Exception:
@@ -453,7 +572,11 @@ def fetch_recent_institutional_data(num_trading_days=12, max_lookback_days=25):
     tries = 0
     while len(results) < num_trading_days and tries < max_lookback_days:
         date_str = d.strftime('%Y%m%d')
-        day_data = fetch_twse_institutional_day(date_str)
+        try:
+            day_data = fetch_twse_institutional_day(date_str)
+        except TwseRateLimitError as e:
+            print(f"⚠️ {e} 停止繼續回溯，改用目前已抓到的 {len(results)} 天。")
+            break
         if day_data:
             results[date_str] = day_data
         d -= timedelta(days=1)
@@ -894,6 +1017,13 @@ def main():
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 啟動 AI 多因子選股系統...")
     audit_past_predictions()
 
+    adapted_threshold, historical_win_rate = compute_self_training_metrics()
+    if historical_win_rate is not None:
+        print(f"📊 [自我訓練] 累積歷史勝率 {historical_win_rate*100:.1f}%"
+              + (f"，門檻自動收緊至 {adapted_threshold} 分" if adapted_threshold else "，暫不調整門檻") + "\n")
+    else:
+        print(f"📊 [自我訓練] 已驗證樣本數不足 {SELF_TRAIN_MIN_SAMPLES} 筆，暫不調整門檻，沿用固定值\n")
+
     market_regime, volatility_regime, _ = detect_market_regime()
     if market_regime == 'BEAR':
         score_threshold = BEAR_SCORE_THRESHOLD
@@ -901,6 +1031,8 @@ def main():
     else:
         score_threshold = ENTRY_SCORE_THRESHOLD
         risk_pct = RISK_PER_TRADE_PCT
+    if adapted_threshold and adapted_threshold > score_threshold:
+        score_threshold = adapted_threshold  # 自我訓練只會收緊門檻，不會放寬（見 compute_self_training_metrics 的說明）
     print(f"🎯 今日進場總分門檻: {score_threshold} 分 ｜ 單筆風險: {risk_pct}% 總資金\n")
 
     dynamic_stock_pool = get_market_active_stocks()
@@ -1013,13 +1145,14 @@ def main():
                         INSERT INTO predictions
                         (predict_date, stock_id, stock_name, latest_price, buy_price, tp_price, sl_price,
                          ai_win_rate, revenue_yoy, pe_ratio, position_size, market_regime,
-                         trailing_stop_price, entry_atr)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         trailing_stop_price, entry_atr, tech_score, fund_score, chip_score, macro_score)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (today_str, stock_id, name, latest_price, buy_price, tp_price, sl_price,
                           total_score,
                           round(latest_yoy, 1) if latest_yoy is not None else None,
                           round(latest_per, 1) if latest_per is not None else None,
-                          pos_size, market_regime, sl_price, round(float(latest_atr), 4)))
+                          pos_size, market_regime, sl_price, round(float(latest_atr), 4),
+                          tech_score, fund_score, chip_score, macro_score))
 
             results.append({
                 '股票代碼': stock_id, '股票名稱': name, '最新收盤價': latest_price,
