@@ -5,6 +5,7 @@ import warnings
 import time
 import os
 import sys
+import io
 import requests
 from datetime import datetime, timedelta
 from FinMind.data import DataLoader
@@ -30,6 +31,7 @@ MARKET_PROXY_ID = '0050'        # FinMind 的 taiwan_stock_daily 沒有加權指
 CANDIDATE_POOL_SIZE = 150       # 候選股數：依 TWSE 全市場成交量排序取前 N 名進入深度多因子評分
 TWSE_STOCK_DAY_ALL_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"  # 全市場單日快照，免費無需權杖
 TWSE_T86_URL = "https://www.twse.com.tw/rwd/zh/fund/T86"  # 三大法人買賣超日報，支援歷史日期回溯查詢
+MOPS_REVENUE_URL_TMPL = "https://mopsov.twse.com.tw/nas/t21/sii/t21sc03_{roc_year}_{month}_0.html"  # 公開資訊觀測站上市公司月營收
 
 # FinMind Token 一律從環境變數讀取（GitHub Actions 用 repo secret 注入），不再寫死於程式碼中
 dl = DataLoader()
@@ -466,6 +468,64 @@ def build_institutional_series(inst_data_by_date, stock_id):
         dealer_vals.append(rec['dealer'] if rec else 0)
     return pd.Series(foreign_vals), pd.Series(trust_vals), pd.Series(dealer_vals)
 
+def _fetch_mops_revenue_month(roc_year, month):
+    """抓 MOPS 公開資訊觀測站某一個月「全部上市公司」的月營收（一次請求涵蓋整個市場，網頁為 Big5 編碼）。
+    回傳 {stock_id: {'revenue': 當月營收, 'yoy_pct': 去年同月增減%, 'mom_pct': 上月比較增減%}}，
+    該月尚未公告或格式解析失敗一律回傳空 dict。"""
+    url = MOPS_REVENUE_URL_TMPL.format(roc_year=roc_year, month=month)
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        resp.raise_for_status()
+        html = resp.content.decode('big5hkscs', errors='replace')
+        tables = pd.read_html(io.StringIO(html))
+    except Exception:
+        return {}
+    result = {}
+    for t in tables:
+        if t.shape[1] != 11:
+            continue
+        for _, row in t.iterrows():
+            try:
+                code = str(row.iloc[0]).strip()
+                if not code or not code[0].isdigit():
+                    continue
+                revenue = float(str(row.iloc[2]).replace(',', ''))
+                mom_pct = float(str(row.iloc[5]).replace(',', ''))
+                yoy_pct = float(str(row.iloc[6]).replace(',', ''))
+            except (ValueError, IndexError):
+                continue
+            result[code] = {'revenue': revenue, 'yoy_pct': yoy_pct, 'mom_pct': mom_pct}
+    return result
+
+def fetch_mops_revenue_snapshot():
+    """全市場最新一期月營收（MOPS），取代原本逐股呼叫 FinMind taiwan_stock_month_revenue。
+    只需要 2 次請求（當期 + 上一期，用來判斷 MoM 是否由負轉正），不是 1 次/股。
+    月營收依規定次月 10 日前公告，從「上個月」開始找，找不到（尚未公告/假期）就再往前一個月，最多試 3 次。
+    回傳 {stock_id: {'yoy_pct': 去年同月增減%, 'mom_turned_positive': bool}}。"""
+    d = datetime.now().replace(day=1) - timedelta(days=1)  # 上個月最後一天，避免抓到「本月」這種一定還沒公告的期別
+    y, m = d.year, d.month
+    current_data = {}
+    for _ in range(3):
+        current_data = _fetch_mops_revenue_month(y - 1911, m)
+        if current_data:
+            break
+        y, m = (y, m - 1) if m > 1 else (y - 1, 12)
+        time.sleep(0.3)
+
+    if not current_data:
+        print("⚠️ MOPS 月營收抓取失敗（連續 3 個月都找不到資料），基本面營收因子將以無資料處理。")
+        return {}
+
+    py, pm = (y, m - 1) if m > 1 else (y - 1, 12)
+    prior_data = _fetch_mops_revenue_month(py - 1911, pm)
+
+    result = {}
+    for code, rec in current_data.items():
+        prior_mom = prior_data.get(code, {}).get('mom_pct')
+        mom_turned_positive = prior_mom is not None and prior_mom < 0 and rec['mom_pct'] > 0
+        result[code] = {'yoy_pct': rec['yoy_pct'], 'mom_turned_positive': mom_turned_positive}
+    return result
+
 # ==========================================
 # 三大因子群評分（P0 優化版）：每個函式回傳 (分數, 細節 dict)，
 # 細節 dict 供個股報告文字使用，不只是給模型內部用的中間值。
@@ -797,6 +857,10 @@ def main():
     inst_data_by_date = fetch_recent_institutional_data()
     print(f"✅ 取得 {len(inst_data_by_date)} 個交易日的法人資料。\n")
 
+    print("📡 抓取最新一期全市場月營收（MOPS 公開資訊觀測站，2 次請求涵蓋全市場，取代逐股呼叫 FinMind）...")
+    mops_revenue_data = fetch_mops_revenue_snapshot()
+    print(f"✅ 取得 {len(mops_revenue_data)} 家公司的月營收資料。\n")
+
     today_str = datetime.now().strftime('%Y-%m-%d')
     start_date = (datetime.now() - timedelta(days=400)).strftime('%Y-%m-%d')      # 動能百分位需要約 1 年資料
     per_start_date = (datetime.now() - timedelta(days=1150)).strftime('%Y-%m-%d')  # 估值河流位階需要約 3 年資料
@@ -824,23 +888,11 @@ def main():
             # 這三個 Series 是各自獨立按日期排序的（tail(n) 語意），不需要也不能對齊 df 的價格列數。
             foreign_series, trust_series, dealer_series = build_institutional_series(inst_data_by_date, stock_id)
 
-            # 基本面：月營收 YoY / MoM 轉正
-            latest_yoy = None
-            mom_turned_positive = False
-            try:
-                df_rev = dl.taiwan_stock_month_revenue(stock_id=stock_id, start_date=start_date)
-                time.sleep(0.1)
-                if not df_rev.empty and 'revenue' in df_rev.columns:
-                    df_rev = df_rev.sort_values(['revenue_year', 'revenue_month']).reset_index(drop=True)
-                    mom = df_rev['revenue'].pct_change()
-                    if len(mom) >= 2:
-                        mom_turned_positive = bool(mom.iloc[-2] < 0 and mom.iloc[-1] > 0)
-                    if 'revenue_year_growth_ratio' in df_rev.columns and not df_rev['revenue_year_growth_ratio'].dropna().empty:
-                        latest_yoy = float(df_rev['revenue_year_growth_ratio'].dropna().iloc[-1])
-                        if 0 < abs(latest_yoy) < 5.0:
-                            latest_yoy *= 100
-            except Exception:
-                pass
+            # 基本面：月營收 YoY / MoM 轉正，改用 MOPS 全市場快照（main() 迴圈外已一次性抓好 mops_revenue_data），
+            # 不用再逐股呼叫 FinMind；MOPS 回傳的 yoy_pct 已經是正確的百分比數值，不需要再做 *100 的猜測性修正。
+            mops_rec = mops_revenue_data.get(stock_id)
+            latest_yoy = mops_rec['yoy_pct'] if mops_rec else None
+            mom_turned_positive = mops_rec['mom_turned_positive'] if mops_rec else False
 
             # 基本面：估值河流位階（近 3 年 PE 百分位）
             per_series = pd.Series(dtype=float)
