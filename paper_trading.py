@@ -36,20 +36,23 @@ TWSE_STOCK_DAY_ALL_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DA
 TWSE_T86_URL = "https://www.twse.com.tw/rwd/zh/fund/T86"  # 三大法人買賣超日報，支援歷史日期回溯查詢
 MOPS_REVENUE_URL_TMPL = "https://mopsov.twse.com.tw/nas/t21/sii/t21sc03_{roc_year}_{month}_0.html"  # 公開資訊觀測站上市公司月營收
 
-# FinMind Token 一律從環境變數讀取（GitHub Actions 用 repo secret 注入），不再寫死於程式碼中
+# FinMind Token 一律從環境變數讀取（GitHub Actions 用 repo secret 注入），不再寫死於程式碼中。
+# DataLoader() 本身不用權杖也不連網，可以放在模組層級；真正的登入動作包成函式、只在
+# 直接執行本檔案時呼叫，這樣其他腳本（例如 cross_market_validation.py）才能安全地
+# import 這裡的評分函式重複使用，不會被迫觸發 FinMind 登入或要求設定 FINMIND_TOKEN。
 dl = DataLoader()
-FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN")
 
-if not FINMIND_TOKEN:
-    print("❌ 未設定 FINMIND_TOKEN 環境變數，無法登入 FinMind，中止執行。")
-    sys.exit(1)
-
-try:
-    dl.login_by_token(api_token=FINMIND_TOKEN)
-    print("✅ FinMind API Token 驗證成功！高流量存取功能已啟動。")
-except Exception as e:
-    print(f"❌ API Token 登入失敗: {e}")
-    sys.exit(1)
+def ensure_finmind_login():
+    token = os.environ.get("FINMIND_TOKEN")
+    if not token:
+        print("❌ 未設定 FINMIND_TOKEN 環境變數，無法登入 FinMind，中止執行。")
+        sys.exit(1)
+    try:
+        dl.login_by_token(api_token=token)
+        print("✅ FinMind API Token 驗證成功！高流量存取功能已啟動。")
+    except Exception as e:
+        print(f"❌ API Token 登入失敗: {e}")
+        sys.exit(1)
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
@@ -1084,4 +1087,5 @@ def main():
         print("今日無符合條件標的。")
 
 if __name__ == "__main__":
+    ensure_finmind_login()
     main()
