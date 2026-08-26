@@ -18,7 +18,9 @@ WEIGHT_FUND = 0.3
 WEIGHT_CHIP = 0.3
 ENTRY_SCORE_THRESHOLD = 70      # 一般/多頭體制進場總分門檻
 BEAR_SCORE_THRESHOLD = 80       # 空頭體制進場總分門檻（提高）
-MIN_FACTOR_SCORE = 40           # 三因子單項一票否決門檻
+MIN_FACTOR_SCORE = 50           # 三因子單項一票否決門檻（P0 優化：40→50，原本 40 分只是平均水準，太容易放行弱因子）
+MIN_DAILY_TURNOVER = 100_000_000  # 流動性門檻：日成交金額 < 1 億視為易滑點，直接排除
+DEFAULT_BETA = 1.0               # 個股 Beta，目前無現成資料來源，先用市場平均值 1.0（等於停用 Beta 相關加嚴條件）
 K_SL = 1.75                     # 停損 ATR 倍數（規格建議 1.5~2.0，取中間值）
 K_TP = 3.0                      # 停利 ATR 倍數
 RISK_PER_TRADE_PCT = 1.0        # 單筆風險占總資金 %（空頭體制會減半）
@@ -241,15 +243,21 @@ def audit_past_predictions():
     conn.close()
 
 def detect_market_regime():
-    start_date = (datetime.now() - timedelta(days=120)).strftime('%Y-%m-%d')
+    """回傳 (趨勢體制, 波動率體制, 大盤收盤價)。
+    趨勢體制 BULL/BEAR/NORMAL：決定進場總分門檻與單筆風險。
+    波動率體制 LOW/NORMAL/HIGH（P0 優化新增）：決定技術面子權重與停損停利 ATR 倍數。"""
+    start_date = (datetime.now() - timedelta(days=200)).strftime('%Y-%m-%d')  # 波動率百分位需要較長歷史
     try:
         df_market = dl.taiwan_stock_daily(stock_id=MARKET_PROXY_ID, start_date=start_date)
         time.sleep(0.1)
         if df_market.empty or len(df_market) < 30:
             print(f"⚠️ [大盤體制模組] 大盤代理股 {MARKET_PROXY_ID} 資料為空或不足 30 筆（可能是 FinMind 額度用盡），退回 NORMAL 體制。")
-            return 'NORMAL', 0.0
+            return 'NORMAL', 'NORMAL', 0.0
 
         df_market = df_market.rename(columns={'close': 'Close'})
+        df_market['date'] = pd.to_datetime(df_market['date'])
+        df_market = df_market.sort_values('date').reset_index(drop=True)
+
         sma_20 = df_market['Close'].rolling(20).mean().iloc[-1]
         sma_60 = df_market['Close'].rolling(60).mean().iloc[-1] if len(df_market) >= 60 else sma_20
         latest_close = df_market['Close'].iloc[-1]
@@ -264,9 +272,22 @@ def detect_market_regime():
             regime = 'NORMAL'
             print("🟡 [大盤體制模組] 大盤處於『震盪整理體制』，採用標準風控機制。")
 
-        return regime, round(latest_close, 2)
+        # 波動率體制：20日已實現波動度，相對自身近半年分布的百分位
+        ret = df_market['Close'].pct_change()
+        realized_vol = ret.rolling(20).std()
+        vol_window = realized_vol.tail(120).dropna()
+        volatility_regime = 'NORMAL'
+        if len(vol_window) >= 30 and pd.notna(realized_vol.iloc[-1]):
+            vol_percentile = float((vol_window <= realized_vol.iloc[-1]).mean() * 100)
+            if vol_percentile >= 67:
+                volatility_regime = 'HIGH'
+            elif vol_percentile <= 33:
+                volatility_regime = 'LOW'
+            print(f"📈 [波動率模組] 大盤 20 日波動度處於近半年 {vol_percentile:.0f} 百分位 → {volatility_regime} 體制。")
+
+        return regime, volatility_regime, round(latest_close, 2)
     except Exception:
-        return 'NORMAL', 0.0
+        return 'NORMAL', 'NORMAL', 0.0
 
 def _curated_stock_universe():
     # 免費 FinMind 帳號（register 等級）不能用 stock_id='' 一次查全市場（要 Sponsor 付費等級才開放，
@@ -368,10 +389,11 @@ def get_market_active_stocks():
     return universe
 
 # ==========================================
-# 三大因子群評分（規格書第 2 節）：每個函式回傳 (分數, 細節 dict)，
+# 三大因子群評分（P0 優化版）：每個函式回傳 (分數, 細節 dict)，
 # 細節 dict 供個股報告文字使用，不只是給模型內部用的中間值。
 # ==========================================
-def score_technical(df):
+def score_technical(df, volatility_regime='NORMAL'):
+    """P0 優化：子維度依大盤波動率動態加權、乖離率改分段曲線、動能融合短期(60天)+長期(252天)。"""
     if len(df) < 60:
         return None, None
     close = df['Close']
@@ -393,13 +415,14 @@ def score_technical(df):
         s_trend = 0.0
         trend_label = "空頭排列 (MA5<MA20)"
 
+    # 乖離率：分段曲線，±5% 內線性到頂，超過後用次方緩衝減分（避免極端值評分失真）
     bias = (c - m20) / m20 * 100
-    if bias <= 0:
-        s_bias = max(0.0, 50 + bias * 10)
-    elif bias <= 5:
-        s_bias = 50 + bias * 10
+    if abs(bias) <= 5:
+        s_bias = 50 + abs(bias) * 10
+    elif bias > 5:
+        s_bias = max(0.0, 100 - (bias - 5) ** 1.5 * 3)
     else:
-        s_bias = max(0.0, 100 - (bias - 5) * 10)
+        s_bias = max(0.0, 100 - (abs(bias) - 5) ** 1.5 * 3)
 
     vol = df['Volume']
     vol_today = float(vol.iloc[-1])
@@ -407,20 +430,31 @@ def score_technical(df):
     vol_ratio = vol_today / (vol_ma20 + 1e-6)
     is_red = bool(close.iloc[-1] > df['Open'].iloc[-1])
     if vol_ratio >= 1.2 and is_red:
-        s_vol = 100.0
+        s_vol_base = 100.0
     elif is_red:
-        s_vol = min(100.0, vol_ratio / 1.2 * 100) * 0.6
+        s_vol_base = min(100.0, vol_ratio / 1.2 * 100) * 0.6
     else:
-        s_vol = min(60.0, vol_ratio / 1.2 * 60)
+        s_vol_base = min(60.0, vol_ratio / 1.2 * 60)
+    vol_multiplier = 0.9 if volatility_regime == 'HIGH' else (1.1 if volatility_regime == 'LOW' else 1.0)
+    s_vol = min(100.0, s_vol_base * vol_multiplier)
 
+    # 動能：短期(60天,60%權重)+長期(252天,40%權重)百分位融合，短期更敏銳、長期防雜訊
     ret5 = close.pct_change(5)
-    window = ret5.tail(252).dropna()
-    if len(window) >= 20:
-        s_mom = float((window <= ret5.iloc[-1]).mean() * 100)
-    else:
-        s_mom = 50.0
+    window_short = ret5.tail(60).dropna()
+    s_mom_short = float((window_short <= ret5.iloc[-1]).mean() * 100) if len(window_short) >= 20 else 50.0
+    window_long = ret5.tail(252).dropna()
+    s_mom_long = float((window_long <= ret5.iloc[-1]).mean() * 100) if len(window_long) >= 20 else 50.0
+    s_mom = s_mom_short * 0.6 + s_mom_long * 0.4
 
-    score = round((s_trend + s_bias + s_vol + s_mom) / 4, 1)
+    # 子維度權重：波動率高時加重趨勢（防守）、波動率低時加重量能與動能（順勢）
+    if volatility_regime == 'HIGH':
+        w_trend, w_bias, w_vol, w_mom = 0.40, 0.25, 0.20, 0.15
+    elif volatility_regime == 'LOW':
+        w_trend, w_bias, w_vol, w_mom = 0.30, 0.20, 0.25, 0.25
+    else:
+        w_trend, w_bias, w_vol, w_mom = 0.35, 0.25, 0.20, 0.20
+
+    score = round(s_trend * w_trend + s_bias * w_bias + s_vol * w_vol + s_mom * w_mom, 1)
     details = {
         'trend_label': trend_label,
         'bias_pct': round(bias, 1),
@@ -433,24 +467,58 @@ def score_technical(df):
     }
     return score, details
 
-def score_fundamental(yoy, mom_turned_positive, per_series):
+def score_fundamental(yoy, mom_turned_positive, per_series,
+                       gross_margin=None, debt_ratio=None, eps_growth_expected=None):
+    """P0 優化：YoY 曲線更陡峭區分增速優劣、PE 窗口縮短至 2 年更敏銳、
+    加入 PEG 比率與毛利率/負債比品質篩選（目前 FinMind 免費版無這些資料，缺值時自動跳過不計分）。"""
     if yoy is None or pd.isna(yoy):
         s_yoy = 50.0
-    elif yoy > 30:
+    elif yoy > 50:
         s_yoy = 100.0
-    elif yoy >= 10:
+    elif yoy > 30:
+        s_yoy = 85.0
+    elif yoy > 15:
         s_yoy = 70.0
+    elif yoy >= 5:
+        s_yoy = 55.0
     elif yoy >= 0:
-        s_yoy = 50.0
+        s_yoy = 40.0
     else:
-        s_yoy = max(0.0, 30 + yoy)
+        s_yoy = max(0.0, 20 + yoy)
     if mom_turned_positive:
         s_yoy = min(100.0, s_yoy + 20)
 
+    margin_penalty = 1.0
+    if gross_margin is not None:
+        if gross_margin < 10:
+            margin_penalty = 0.6
+        elif gross_margin < 15:
+            margin_penalty = 0.8
+
+    debt_penalty = 1.0
+    if debt_ratio is not None:
+        if debt_ratio > 70:
+            debt_penalty = 0.5
+        elif debt_ratio > 50:
+            debt_penalty = 0.8
+
     per_clean = per_series.dropna()
-    per_window = per_clean.tail(756)  # 約 3 年交易日
+    per_window = per_clean.tail(504)  # 2 年，比原本 3 年窗口更敏銳
     current_per = per_clean.iloc[-1] if not per_clean.empty else None
     percentile = None
+
+    peg_score = 50.0
+    if eps_growth_expected is not None and eps_growth_expected > 0 and current_per is not None:
+        peg = float(current_per) / eps_growth_expected
+        if peg < 1.0:
+            peg_score = 100.0
+        elif peg < 1.5:
+            peg_score = 75.0
+        elif peg < 2.0:
+            peg_score = 60.0
+        else:
+            peg_score = max(0.0, 100 - (peg - 2.0) * 20)
+
     if current_per is not None and len(per_window) >= 60:
         percentile = float((per_window <= current_per).mean() * 100)
         if percentile <= 20:
@@ -462,17 +530,25 @@ def score_fundamental(yoy, mom_turned_positive, per_series):
     else:
         s_val = 50.0
 
-    score = round(s_yoy * 0.55 + s_val * 0.45, 1)
+    quality_score = 100 * margin_penalty * debt_penalty
+    score = round(s_yoy * 0.35 + s_val * 0.40 + peg_score * 0.15 + quality_score * 0.10, 1)
     details = {
         'yoy': yoy,
         'mom_turned_positive': bool(mom_turned_positive),
         'per_current': float(current_per) if current_per is not None else None,
         'per_percentile': percentile,
+        'peg_score': peg_score,
+        'margin_penalty': margin_penalty,
+        'debt_penalty': debt_penalty,
     }
     return score, details
 
-def score_chip(foreign_net, trust_net, volume):
+def score_chip(foreign_net, trust_net, volume, proprietary_net=None):
+    """P0 優化：連續買超天數上限改 10 天（更符合現實）、加入買超加速度指標、
+    自營商資料（若抓得到）作為反向訊號警示。"""
     def streak_count(net_series):
+        if net_series is None or net_series.empty:
+            return 0
         recent = net_series.tail(10)
         streak = 0
         for v in recent.iloc[::-1]:
@@ -484,19 +560,48 @@ def score_chip(foreign_net, trust_net, volume):
 
     f_streak = streak_count(foreign_net)
     t_streak = streak_count(trust_net)
-    s_foreign = min(100.0, f_streak / 5 * 100)
-    s_trust = min(100.0, t_streak / 5 * 100)
+    p_streak = streak_count(proprietary_net)
+    s_foreign = min(100.0, f_streak / 10 * 100)
+    s_trust = min(100.0, t_streak / 10 * 100)
+    s_proprietary = min(100.0, p_streak / 10 * 100) if proprietary_net is not None and not proprietary_net.empty else 50.0
+
+    acceleration_bonus = 0.0
+    recent_5d = foreign_net.tail(5)
+    if len(recent_5d) >= 3:
+        trend = recent_5d.iloc[-1] - recent_5d.iloc[-3]
+        if trend > 0:
+            acceleration_bonus = 10.0
 
     combined_5d = foreign_net.tail(5).sum() + trust_net.tail(5).sum()
     volume_5d = volume.tail(5).sum()
     ratio = combined_5d / (volume_5d + 1e-6)  # 用股數比例代替金額比例（FinMind 籌碼資料為股數，非金額）
-    s_strength = max(0.0, min(100.0, ratio / 0.1 * 100))
+    if ratio > 0.05:
+        s_strength = 100.0
+    elif ratio > 0.02:
+        s_strength = min(100.0, ratio / 0.05 * 100)
+    else:
+        s_strength = max(0.0, ratio / 0.02 * 50)
 
-    score = round(s_foreign * 0.3 + s_trust * 0.4 + s_strength * 0.3, 1)
+    prop_vs_inst = 1.0
+    prop_warning = False
+    if proprietary_net is not None and not proprietary_net.empty:
+        prop_recent = proprietary_net.tail(5).sum()
+        inst_recent = foreign_net.tail(5).sum() + trust_net.tail(5).sum()
+        if prop_recent < -100 and inst_recent > 100:
+            prop_vs_inst = 0.85
+            prop_warning = True
+
+    score = round(
+        (s_foreign * 0.25 + s_trust * 0.35 + s_proprietary * 0.15 + s_strength * 0.25 + acceleration_bonus)
+        * prop_vs_inst, 1
+    )
     details = {
         'foreign_streak': f_streak,
         'trust_streak': t_streak,
+        'proprietary_streak': p_streak,
         'strength_ratio_pct': round(ratio * 100, 2),
+        'acceleration_bonus': acceleration_bonus,
+        'prop_vs_inst_warning': prop_warning,
     }
     return score, details
 
@@ -505,35 +610,100 @@ def build_stock_report(name, stock_id, latest_price, tech_score, tech_d,
                         total_score, passed, score_threshold):
     yoy_txt = f"{fund_d['yoy']:.1f}%" if fund_d['yoy'] is not None else "無資料"
     per_txt = f"{fund_d['per_current']:.1f} 倍" if fund_d['per_current'] is not None else "無資料"
-    per_pct_txt = f"（近3年百分位 {fund_d['per_percentile']:.0f}%，越低越便宜）" if fund_d['per_percentile'] is not None else ""
+    per_pct_txt = f"（近2年百分位 {fund_d['per_percentile']:.0f}%，越低越便宜）" if fund_d['per_percentile'] is not None else ""
     mom_txt = "，月營收由負轉正" if fund_d['mom_turned_positive'] else ""
+    quality_txt = ""
+    if fund_d.get('margin_penalty', 1.0) < 1.0 or fund_d.get('debt_penalty', 1.0) < 1.0:
+        quality_txt = "（⚠️ 毛利率或負債比未達標，基本面已打折）"
+
+    accel_txt = "，買超力道正在加速" if chip_d.get('acceleration_bonus', 0) > 0 else ""
+    prop_txt = "｜⚠️ 自營商同期賣超，與法人方向不一致" if chip_d.get('prop_vs_inst_warning') else ""
 
     lines = [
         f"【{name}({stock_id})】最新收盤 NT$ {latest_price}",
         f"總分 {total_score} 分（進場門檻 {score_threshold} 分）— {'✅ 達進場標準' if passed else '⚪ 尚未達標，列入觀察'}",
         f"技術面 {tech_score} 分：{tech_d['trend_label']}，乖離率 {tech_d['bias_pct']}%，"
         f"量比 {tech_d['vol_ratio']} 倍（{'收紅' if tech_d['is_red'] else '收黑'}），"
-        f"近一年 5 日報酬動能百分位 {tech_d['momentum_pct']}%",
-        f"基本面 {fund_score} 分：營收 YoY {yoy_txt}{mom_txt}，PE {per_txt}{per_pct_txt}",
+        f"動能百分位（短60/長252天融合）{tech_d['momentum_pct']}%",
+        f"基本面 {fund_score} 分：營收 YoY {yoy_txt}{mom_txt}，PE {per_txt}{per_pct_txt}{quality_txt}",
         f"籌碼面 {chip_score} 分：外資連續買超 {chip_d['foreign_streak']} 天，"
         f"投信連續買超 {chip_d['trust_streak']} 天，"
-        f"近5日法人買超力道占成交量比例 {chip_d['strength_ratio_pct']}%",
+        f"近5日法人買超力道占成交量比例 {chip_d['strength_ratio_pct']}%{accel_txt}{prop_txt}",
         f"成交量：今日 {tech_d['volume_today']:,.0f} 股，20日均量 {tech_d['volume_avg20']:,.0f} 股，"
         f"較均量{'放大' if tech_d['volume_surge_pct'] >= 0 else '萎縮'} {abs(tech_d['volume_surge_pct']):.1f}%",
     ]
     return "\n".join(lines)
 
+def calculate_stops(close_price, atr14, volatility_regime='NORMAL', beta=DEFAULT_BETA):
+    """P0 優化：停損停利倍數依大盤波動率動態調整、依個股 Beta 加寬（beta=1.0 時無調整）、
+    強制最低風報比 1.5:1（不足則放寬停利，不動停損以免風險擴大）。"""
+    if volatility_regime == 'LOW':
+        k_sl_base, k_tp_base = 1.5, 2.5
+    elif volatility_regime == 'HIGH':
+        k_sl_base, k_tp_base = 2.0, 3.5
+    else:
+        k_sl_base, k_tp_base = K_SL, K_TP
+
+    # beta=1.0（無資料時的預設值）時 beta_factor=0，不做任何調整；beta>1 時停損停利同步加寬
+    beta_factor = max(0.0, (beta - 1.0) * 0.3)
+    k_sl = k_sl_base + beta_factor
+    k_tp = k_tp_base + beta_factor * 0.5
+
+    sl_price = close_price - k_sl * atr14
+    tp_price = close_price + k_tp * atr14
+    if sl_price <= 0:
+        sl_price = max(0.01, close_price * 0.8)
+
+    risk_amt = close_price - sl_price
+    profit_amt = tp_price - close_price
+    rr_ratio = profit_amt / (risk_amt + 1e-6)
+    if rr_ratio < 1.5:
+        tp_price = close_price + (close_price - sl_price) * 1.5
+        rr_ratio = 1.5
+
+    return {
+        'sl_price': round(sl_price, 2), 'tp_price': round(tp_price, 2),
+        'rr_ratio': round(rr_ratio, 2), 'k_sl': round(k_sl, 3), 'k_tp': round(k_tp, 3),
+    }
+
 def calculate_position_size(buy_price, sl_price, risk_pct):
-    sl_pct = (buy_price - sl_price) / buy_price
-    if sl_pct <= 0:
+    """P0 優化：加入邊界檢查（停損高於買價、停損幅度過大直接不進場），部位四捨五入到 0.5% 級距。"""
+    if buy_price <= 0 or sl_price >= buy_price:
         return 0.0
-    return round(min(risk_pct / sl_pct, MAX_POSITION_PCT), 1)
+    sl_pct = (buy_price - sl_price) / buy_price
+    if sl_pct <= 0 or sl_pct > 0.5:
+        return 0.0
+    position_size = min(risk_pct / sl_pct, MAX_POSITION_PCT)
+    return round(position_size * 2) / 2
+
+def check_entry_conditions(tech_score, fund_score, chip_score, total_score,
+                            score_threshold, daily_volume_amt=None, beta=DEFAULT_BETA):
+    """P0 優化風控：單項因子門檻 40→50、加入反向訊號判斷（技術破位但基本籌碼強→棄權等確認）、
+    流動性檢查（日成交金額 <1億排除）、高 Beta 股更嚴格門檻（beta=1.0 預設值下此條件不生效）。"""
+    threshold = max(score_threshold, 75.0) if beta > 1.3 else score_threshold
+    if total_score < threshold:
+        return False, f"總分不足 ({total_score} < {threshold})"
+
+    min_score = min(tech_score, fund_score, chip_score)
+    if min_score < MIN_FACTOR_SCORE:
+        return False, f"存在弱因子 (最低: {min_score} < {MIN_FACTOR_SCORE})"
+
+    if tech_score < 45 and (fund_score + chip_score) > 140:
+        return False, "技術面疲弱但基本籌碼面強，棄權等待技術面確認"
+
+    if daily_volume_amt is not None and daily_volume_amt < MIN_DAILY_TURNOVER:
+        return False, f"日成交金額太小 ({daily_volume_amt/1e8:.2f}億 < 1億)，易滑點"
+
+    if beta > 1.5 and (total_score < 75 or min_score < 55):
+        return False, f"高 Beta ({beta}) 需更高門檻"
+
+    return True, f"✅ 進場確認 (總分: {total_score})"
 
 def main():
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 啟動 AI 多因子選股系統...")
     audit_past_predictions()
 
-    market_regime, _ = detect_market_regime()
+    market_regime, volatility_regime, _ = detect_market_regime()
     if market_regime == 'BEAR':
         score_threshold = BEAR_SCORE_THRESHOLD
         risk_pct = RISK_PER_TRADE_PCT / 2
@@ -567,7 +737,8 @@ def main():
             df['date'] = pd.to_datetime(df['date'])
             df = df.sort_values('date').reset_index(drop=True)
 
-            # 籌碼面：三大法人買賣超
+            # 籌碼面：三大法人買賣超（含自營商，用於 P0 優化的反向訊號檢查；FinMind 免費版類別名稱
+            # 若對不上會自動變成全 0，不影響其餘計算，只是自營商反向訊號檢查會靜默失效）
             df_chip = dl.taiwan_stock_institutional_investors(stock_id=stock_id, start_date=start_date)
             time.sleep(0.15)
             if not df_chip.empty:
@@ -575,11 +746,14 @@ def main():
                                       df_chip[df_chip['name'] == 'Foreign_Investor'].groupby('date')['sell'].sum()
                 trust_net_by_date = df_chip[df_chip['name'] == 'Investment_Trust'].groupby('date')['buy'].sum() - \
                                     df_chip[df_chip['name'] == 'Investment_Trust'].groupby('date')['sell'].sum()
+                dealer_net_by_date = df_chip[df_chip['name'] == 'Dealer_self'].groupby('date')['buy'].sum() - \
+                                     df_chip[df_chip['name'] == 'Dealer_self'].groupby('date')['sell'].sum()
                 date_key = df['date'].dt.strftime('%Y-%m-%d')
                 df['Foreign_Buy'] = date_key.map(foreign_net_by_date).fillna(0)
                 df['Trust_Buy'] = date_key.map(trust_net_by_date).fillna(0)
+                df['Dealer_Buy'] = date_key.map(dealer_net_by_date).fillna(0)
             else:
-                df['Foreign_Buy'], df['Trust_Buy'] = 0.0, 0.0
+                df['Foreign_Buy'], df['Trust_Buy'], df['Dealer_Buy'] = 0.0, 0.0, 0.0
 
             # 基本面：月營收 YoY / MoM 轉正
             latest_yoy = None
@@ -619,25 +793,32 @@ def main():
             if latest_per is not None and (latest_per > 80.0 or latest_per < 0):
                 continue
 
-            tech_score, tech_detail = score_technical(df)
+            tech_score, tech_detail = score_technical(df, volatility_regime=volatility_regime)
             if tech_score is None:
                 continue
             fund_score, fund_detail = score_fundamental(latest_yoy, mom_turned_positive, per_series)
-            chip_score, chip_detail = score_chip(df['Foreign_Buy'], df['Trust_Buy'], df['Volume'])
+            chip_score, chip_detail = score_chip(df['Foreign_Buy'], df['Trust_Buy'], df['Volume'],
+                                                  proprietary_net=df.get('Dealer_Buy'))
 
             total_score = round(tech_score * WEIGHT_TECH + fund_score * WEIGHT_FUND + chip_score * WEIGHT_CHIP, 1)
-            passed = total_score >= score_threshold and min(tech_score, fund_score, chip_score) >= MIN_FACTOR_SCORE
+
+            daily_volume_amt = float(df['Trading_money'].iloc[-1]) if 'Trading_money' in df.columns else None
+            passed, entry_reason = check_entry_conditions(
+                tech_score, fund_score, chip_score, total_score, score_threshold,
+                daily_volume_amt=daily_volume_amt, beta=DEFAULT_BETA
+            )
 
             latest_price = round(float(df['Close'].iloc[-1]), 2)
             atr_series = get_atr14(df)
             latest_atr = atr_series.iloc[-1] if pd.notna(atr_series.iloc[-1]) else latest_price * 0.02
 
             buy_price = latest_price
-            sl_price = round(buy_price - K_SL * latest_atr, 2)
-            tp_price = round(buy_price + K_TP * latest_atr, 2)
+            stops = calculate_stops(buy_price, latest_atr, volatility_regime=volatility_regime, beta=DEFAULT_BETA)
+            sl_price = stops['sl_price']
+            tp_price = stops['tp_price']
             pos_size = calculate_position_size(buy_price, sl_price, risk_pct)
 
-            status_label = "🔥 建議買進" if passed else "☁️ 觀望"
+            status_label = "🔥 建議買進" if passed else f"☁️ 觀望（{entry_reason}）"
 
             if passed:
                 check_df = pd.read_sql(
