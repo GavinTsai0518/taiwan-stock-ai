@@ -246,6 +246,7 @@ def detect_market_regime():
         df_market = dl.taiwan_stock_daily(stock_id=MARKET_PROXY_ID, start_date=start_date)
         time.sleep(0.1)
         if df_market.empty or len(df_market) < 30:
+            print(f"⚠️ [大盤體制模組] 大盤代理股 {MARKET_PROXY_ID} 資料為空或不足 30 筆（可能是 FinMind 額度用盡），退回 NORMAL 體制。")
             return 'NORMAL', 0.0
 
         df_market = df_market.rename(columns={'close': 'Close'})
@@ -553,11 +554,13 @@ def main():
     results = []
     all_candidates = []
 
+    empty_price_count = 0
     for stock_id, name in dynamic_stock_pool.items():
         try:
             df = dl.taiwan_stock_daily(stock_id=stock_id, start_date=start_date)
             time.sleep(0.15)
             if df.empty or len(df) < 60:
+                empty_price_count += 1
                 continue
             df = df.rename(columns={'max': 'High', 'min': 'Low', 'close': 'Close',
                                      'open': 'Open', 'Trading_Volume': 'Volume'})
@@ -680,6 +683,9 @@ def main():
             })
         except Exception:
             continue
+
+    print(f"📊 掃描完成：{len(all_candidates)}/{len(dynamic_stock_pool)} 支成功取得評分，"
+          f"{empty_price_count} 支股價資料為空或不足 60 筆（可能是 FinMind 額度用盡或當日尚無資料）。")
 
     # ===== 每日觀察報告：不論是否達進場門檻，總分前十名 + 成交量異常放大前十名，各附個別報告 =====
     cursor = conn.cursor()
