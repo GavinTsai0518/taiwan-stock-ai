@@ -241,6 +241,46 @@ with col2:
 with col3:
     st.metric("真實實戰勝率", f"{win_rate:.1f}%")
 
+# 自我訓練狀態：讀 model_metrics 最新一筆（paper_trading.py 的 compute_self_training_metrics
+# 每天執行時會寫入一筆）。這張表可能還不存在（例如本機從沒跑過完整排程），讀取失敗就靜默跳過，
+# 不影響其他區塊。
+BASE_ENTRY_THRESHOLD = 70  # 對應 paper_trading.py 的 ENTRY_SCORE_THRESHOLD，用來判斷門檻有沒有被收緊
+SELF_TRAIN_MIN_SAMPLES = 20
+
+def load_latest_model_metrics():
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        df = pd.read_sql("SELECT * FROM model_metrics ORDER BY id DESC LIMIT 1", conn)
+        conn.close()
+        return df.iloc[0] if not df.empty else None
+    except Exception:
+        return None
+
+metrics_row = load_latest_model_metrics()
+if metrics_row is not None:
+    st.markdown("##### 🧠 自我訓練狀態")
+    resolved = int(metrics_row.get('resolved_count') or 0)
+    hist_wr = metrics_row.get('historical_win_rate')
+    adapted = metrics_row.get('adapted_threshold')
+    top_feat = metrics_row.get('top_feature')
+
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.metric("累積已驗證樣本", f"{resolved} / {SELF_TRAIN_MIN_SAMPLES} 筆")
+    with m2:
+        if pd.notna(hist_wr):
+            st.metric("自我訓練歷史勝率", f"{float(hist_wr) * 100:.1f}%")
+        else:
+            st.metric("自我訓練歷史勝率", "樣本不足")
+    with m3:
+        if pd.notna(adapted) and float(adapted) > BASE_ENTRY_THRESHOLD:
+            st.metric("目前進場門檻", f"{float(adapted):.0f} 分", delta=f"+{float(adapted) - BASE_ENTRY_THRESHOLD:.0f}（已自動收緊）")
+        else:
+            st.metric("目前進場門檻", f"{BASE_ENTRY_THRESHOLD} 分（固定值）")
+    if isinstance(top_feat, str) and top_feat and '樣本不足' not in top_feat:
+        st.caption(f"目前最能區分勝負的子維度：{top_feat}")
+    st.caption(f"最近一次評估日期：{metrics_row.get('eval_date', '未知')}")
+
 st.divider()
 
 # 6. 頁籤渲染
