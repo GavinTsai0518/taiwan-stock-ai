@@ -5,6 +5,7 @@ import warnings
 import time
 import os
 import sys
+import requests
 from datetime import datetime, timedelta
 from FinMind.data import DataLoader
 
@@ -26,6 +27,9 @@ K_TP = 3.0                      # 停利 ATR 倍數
 RISK_PER_TRADE_PCT = 1.0        # 單筆風險占總資金 %（空頭體制會減半）
 MAX_POSITION_PCT = 10.0         # 單檔部位上限 %
 MARKET_PROXY_ID = '0050'        # FinMind 的 taiwan_stock_daily 沒有加權指數代碼，改用追蹤大盤的 0050 ETF 代理
+CANDIDATE_POOL_SIZE = 150       # 候選股數：依 TWSE 全市場成交量排序取前 N 名進入深度多因子評分
+TWSE_STOCK_DAY_ALL_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"  # 全市場單日快照，免費無需權杖
+TWSE_T86_URL = "https://www.twse.com.tw/rwd/zh/fund/T86"  # 三大法人買賣超日報，支援歷史日期回溯查詢
 
 # FinMind Token 一律從環境變數讀取（GitHub Actions 用 repo secret 注入），不再寫死於程式碼中
 dl = DataLoader()
@@ -370,23 +374,97 @@ def _curated_stock_universe():
         '6414': '樺漢',
     }
 
+def fetch_twse_market_snapshot():
+    """全市場當日快照（TWSE OpenAPI STOCK_DAY_ALL）：免費、不需權杖、單次請求取得約 1,300+ 檔
+    上市證券的當日 OHLC 與成交量。只回傳「最新一個交易日」，不支援歷史日期查詢。
+    用 4 碼純數字且不以 00 開頭排除 ETF / 權證（實測 00 開頭的 4 碼代碼只有 0050/0056 等 8 檔舊制 ETF，
+    新制 ETF 代碼多為 5~6 碼，天然就會被 4 碼過濾掉）。"""
+    resp = requests.get(TWSE_STOCK_DAY_ALL_URL, headers={"Accept": "application/json"}, timeout=20)
+    resp.raise_for_status()
+    rows = resp.json()
+    result = []
+    for r in rows:
+        code = str(r.get('Code', ''))
+        if len(code) == 4 and code.isdigit() and not code.startswith('00'):
+            try:
+                volume = int(r['TradeVolume'])
+            except (ValueError, TypeError, KeyError):
+                continue
+            result.append({'stock_id': code, 'stock_name': str(r.get('Name', code)).strip(), 'volume': volume})
+    return result
+
 def get_market_active_stocks():
-    """候選股清單：手動列出的大範圍清單（涵蓋各主要產業），用 taiwan_stock_info() 驗證代碼
-    有效性並取得正確股名（免費 FinMind 帳號可用），錯誤或已下市的代碼會自動被濾掉。"""
-    universe = _curated_stock_universe()
+    """候選股清單：改用 TWSE OpenAPI 全市場快照，依當日成交量排序取前 CANDIDATE_POOL_SIZE 名。
+    免費、無流量限制、不佔用 FinMind 額度，真正反映全市場當下最活躍的股票（不是固定清單）。
+    抓取失敗時退回手動維護的產業分散候選清單。"""
     try:
-        stock_info = dl.taiwan_stock_info()
-        time.sleep(0.15)
-        if not stock_info.empty:
-            stock_info = stock_info[stock_info['type'] == 'twse']
-            stock_info = stock_info.drop_duplicates('stock_id')
-            name_map = stock_info.set_index('stock_id')['stock_name'].to_dict()
-            pool = {sid: name_map[sid] for sid in universe if sid in name_map}
-            if pool:
-                return pool
+        snapshot = fetch_twse_market_snapshot()
+        if not snapshot:
+            print("⚠️ TWSE 全市場快照為空，退回備援清單。")
+            return _curated_stock_universe()
+        snapshot.sort(key=lambda r: r['volume'], reverse=True)
+        top = snapshot[:CANDIDATE_POOL_SIZE]
+        return {r['stock_id']: r['stock_name'] for r in top}
+    except Exception as e:
+        print(f"⚠️ TWSE 全市場快照抓取失敗（{e}），退回備援清單。")
+        return _curated_stock_universe()
+
+def fetch_twse_institutional_day(date_str):
+    """單日全市場三大法人買賣超（TWSE T86），date_str 格式 YYYYMMDD。
+    回傳 {stock_id: {'foreign': 外資淨買超股數, 'trust': 投信淨買超股數, 'dealer': 自營商淨買超股數}}；
+    非交易日（假日）或請求失敗一律回傳空 dict，由呼叫端自行跳過。"""
+    try:
+        resp = requests.get(
+            TWSE_T86_URL, params={'date': date_str, 'selectType': 'ALL', 'response': 'json'}, timeout=20
+        )
+        resp.raise_for_status()
+        data = resp.json()
     except Exception:
-        pass
-    return universe
+        return {}
+    if data.get('stat') != 'OK':
+        return {}
+    result = {}
+    for row in data.get('data', []):
+        try:
+            code = str(row[0]).strip()
+            foreign_net = int(str(row[4]).replace(',', ''))
+            trust_net = int(str(row[10]).replace(',', ''))
+            dealer_net = int(str(row[11]).replace(',', ''))
+        except (IndexError, ValueError, AttributeError):
+            continue
+        result[code] = {'foreign': foreign_net, 'trust': trust_net, 'dealer': dealer_net}
+    return result
+
+def fetch_recent_institutional_data(num_trading_days=12, max_lookback_days=25):
+    """從今天往回抓最近 num_trading_days 個交易日的全市場三大法人資料。
+    關鍵優化：一天只打 1 次 API（全市場一起拿），不是一支股票打 1 次——
+    對 150 支候選股來說，原本要 150 次 FinMind 呼叫，現在只要 ~12 次 TWSE 呼叫。
+    回傳 {YYYYMMDD: {stock_id: {...}}}，非交易日自動跳過。"""
+    results = {}
+    d = datetime.now()
+    tries = 0
+    while len(results) < num_trading_days and tries < max_lookback_days:
+        date_str = d.strftime('%Y%m%d')
+        day_data = fetch_twse_institutional_day(date_str)
+        if day_data:
+            results[date_str] = day_data
+        d -= timedelta(days=1)
+        tries += 1
+        time.sleep(0.3)
+    return results
+
+def build_institutional_series(inst_data_by_date, stock_id):
+    """把 {日期: {股票代碼: {...}}} 轉成單一股票的 (外資, 投信, 自營商) 三個 pandas Series，
+    依日期由舊到新排序（符合 score_chip() 的 tail() 語意：最後一筆是最新一天）。
+    缺資料的日期一律補 0（等同「當天無明顯買賣超」，不影響 streak 計算的保守性）。"""
+    dates_sorted = sorted(inst_data_by_date.keys())
+    foreign_vals, trust_vals, dealer_vals = [], [], []
+    for d in dates_sorted:
+        rec = inst_data_by_date[d].get(stock_id)
+        foreign_vals.append(rec['foreign'] if rec else 0)
+        trust_vals.append(rec['trust'] if rec else 0)
+        dealer_vals.append(rec['dealer'] if rec else 0)
+    return pd.Series(foreign_vals), pd.Series(trust_vals), pd.Series(dealer_vals)
 
 # ==========================================
 # 三大因子群評分（P0 優化版）：每個函式回傳 (分數, 細節 dict)，
@@ -715,6 +793,10 @@ def main():
     dynamic_stock_pool = get_market_active_stocks()
     print(f"✅ 鎖定 {len(dynamic_stock_pool)} 支熱門標的，開始執行多因子評分...\n")
 
+    print("📡 抓取近期全市場三大法人買賣超（TWSE T86，一天一次呼叫，取代原本一股一次的 FinMind 呼叫）...")
+    inst_data_by_date = fetch_recent_institutional_data()
+    print(f"✅ 取得 {len(inst_data_by_date)} 個交易日的法人資料。\n")
+
     today_str = datetime.now().strftime('%Y-%m-%d')
     start_date = (datetime.now() - timedelta(days=400)).strftime('%Y-%m-%d')      # 動能百分位需要約 1 年資料
     per_start_date = (datetime.now() - timedelta(days=1150)).strftime('%Y-%m-%d')  # 估值河流位階需要約 3 年資料
@@ -737,23 +819,10 @@ def main():
             df['date'] = pd.to_datetime(df['date'])
             df = df.sort_values('date').reset_index(drop=True)
 
-            # 籌碼面：三大法人買賣超（含自營商，用於 P0 優化的反向訊號檢查；FinMind 免費版類別名稱
-            # 若對不上會自動變成全 0，不影響其餘計算，只是自營商反向訊號檢查會靜默失效）
-            df_chip = dl.taiwan_stock_institutional_investors(stock_id=stock_id, start_date=start_date)
-            time.sleep(0.15)
-            if not df_chip.empty:
-                foreign_net_by_date = df_chip[df_chip['name'] == 'Foreign_Investor'].groupby('date')['buy'].sum() - \
-                                      df_chip[df_chip['name'] == 'Foreign_Investor'].groupby('date')['sell'].sum()
-                trust_net_by_date = df_chip[df_chip['name'] == 'Investment_Trust'].groupby('date')['buy'].sum() - \
-                                    df_chip[df_chip['name'] == 'Investment_Trust'].groupby('date')['sell'].sum()
-                dealer_net_by_date = df_chip[df_chip['name'] == 'Dealer_self'].groupby('date')['buy'].sum() - \
-                                     df_chip[df_chip['name'] == 'Dealer_self'].groupby('date')['sell'].sum()
-                date_key = df['date'].dt.strftime('%Y-%m-%d')
-                df['Foreign_Buy'] = date_key.map(foreign_net_by_date).fillna(0)
-                df['Trust_Buy'] = date_key.map(trust_net_by_date).fillna(0)
-                df['Dealer_Buy'] = date_key.map(dealer_net_by_date).fillna(0)
-            else:
-                df['Foreign_Buy'], df['Trust_Buy'], df['Dealer_Buy'] = 0.0, 0.0, 0.0
+            # 籌碼面：三大法人買賣超（含自營商），改用 TWSE T86 全市場資料（main() 迴圈外已一次性
+            # 抓好 inst_data_by_date），不用再逐股呼叫 FinMind，自營商欄位也是官方正確欄位，不用再用猜的。
+            # 這三個 Series 是各自獨立按日期排序的（tail(n) 語意），不需要也不能對齊 df 的價格列數。
+            foreign_series, trust_series, dealer_series = build_institutional_series(inst_data_by_date, stock_id)
 
             # 基本面：月營收 YoY / MoM 轉正
             latest_yoy = None
@@ -797,8 +866,8 @@ def main():
             if tech_score is None:
                 continue
             fund_score, fund_detail = score_fundamental(latest_yoy, mom_turned_positive, per_series)
-            chip_score, chip_detail = score_chip(df['Foreign_Buy'], df['Trust_Buy'], df['Volume'],
-                                                  proprietary_net=df.get('Dealer_Buy'))
+            chip_score, chip_detail = score_chip(foreign_series, trust_series, df['Volume'],
+                                                  proprietary_net=dealer_series)
 
             total_score = round(tech_score * WEIGHT_TECH + fund_score * WEIGHT_FUND + chip_score * WEIGHT_CHIP, 1)
 
