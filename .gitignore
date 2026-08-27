@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Secrets — never commit real credentials. FINMIND_TOKEN etc. belong in
+# GitHub Actions repo secrets and Streamlit Cloud app secrets, not here.
+.streamlit/secrets.toml
+*.env
+.env.*
+
+# Local scratch / experiment output (not the production paper_trading.db,
+# which IS intentionally tracked — GitHub Actions commits it daily)
+.ml_cache/
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
