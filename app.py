@@ -95,36 +95,6 @@ def init_all_tables():
 
 init_all_tables()
 
-# --- 修正 3：predictions 表格原本永遠沒有資料來源，這裡補一個「示範資料」產生器 ---
-# 這不是真正的 AI 選股邏輯，只是讓介面有東西可以顯示。
-# 你要接自己的模型時，把真正的推薦結果 INSERT 進 predictions 表即可，
-# 欄位格式跟這個函式一致。
-def seed_demo_predictions_if_empty():
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        today_str = datetime.now().strftime('%Y-%m-%d')
-        cursor.execute("SELECT COUNT(*) FROM predictions WHERE predict_date = ?", (today_str,))
-        count_today = cursor.fetchone()[0]
-        if count_today == 0:
-            demo_rows = [
-                (today_str, "2330", "台積電", 1050.0, 1045.0, 1120.0, 1010.0, 68.5, "PENDING", 0, 0, None, 12.3, 22.1, 8.0, "DEMO"),
-                (today_str, "2317", "鴻海", 205.0, 203.0, 220.0, 195.0, 61.2, "PENDING", 0, 0, None, 5.6, 11.4, 5.0, "DEMO"),
-            ]
-            cursor.executemany('''
-                INSERT INTO predictions
-                (predict_date, stock_id, stock_name, latest_price, buy_price, tp_price, sl_price,
-                 ai_win_rate, status, real_max_price, real_min_price, validated_date,
-                 revenue_yoy, pe_ratio, position_size, market_regime)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', demo_rows)
-            conn.commit()
-        conn.close()
-    except Exception as e:
-        st.warning(f"示範資料建立失敗（不影響其他功能）：{e}")
-
-seed_demo_predictions_if_empty()
-
 # 3. 自選股操作函數
 # 存在瀏覽器網址列的 query params 裡，不寫本地 SQLite——paper_trading.db 每天會被排程
 # 整份覆蓋、Streamlit Cloud 重新部署或閒置喚醒也會重置容器內的檔案，寫在裡面的自選股
@@ -298,9 +268,6 @@ if not df_all.empty and 'predict_date' in df_all.columns:
 # Tab 1: 今日 AI 精選
 with tab1:
     st.subheader(f"🤖 今日 ({today_str}) AI 精選標的與建議")
-    is_demo_data = not df_today.empty and 'market_regime' in df_today.columns and (df_today['market_regime'] == 'DEMO').all()
-    if is_demo_data:
-        st.caption("⚠️ 今日 AI 引擎尚未產生真實推薦（可能排程未執行或無標的達標），目前顯示為示範資料。")
     if not df_today.empty:
         for _, row in df_today.iterrows():
             l_price = float(row.get('latest_price', 0))
@@ -327,7 +294,8 @@ with tab1:
             with st.expander("📖 點擊查看風控細節與買賣點算價"):
                 st.write(f"- **建議買入價**：`NT$ {row.get('buy_price', l_price)}` | **停利價**：`NT$ {tp_p}` | **停損價**：`NT$ {sl_p}` | **風報比**：`{rr_ratio}`")
     else:
-        st.info("今日市場經 AI 與風控過濾後無符合進場條件之標的，建議觀望保持現金。")
+        st.info("今日尚無推薦標的——可能是排程今天還沒執行，也可能是排程執行過但沒有股票達到進場門檻"
+                "（兩種情況都代表目前沒有真實推薦，不是系統顯示假資料）。")
 
 # Tab 2: K線與圖表
 with tab2:
